@@ -40,8 +40,19 @@ spec:
               value: "argocd"
             - name: ARGOCD_CLUSTER_SECRET_NAMESPACE
               value: "argocd"
-            - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE
-              value: "loft-{project}-vcluster-{virtualcluster}"
+            # Auto-detects both the v2 ("connector") and legacy (v1) cluster
+            # name conventions. Cluster Secrets are discovered by the
+            # argocd.argoproj.io/secret-type=cluster label and matched on
+            # data.name / data.server, NOT by metadata.name, so v2 Secrets with
+            # an Argo CD-generated metadata.name still resolve. Each template is
+            # also tried with the v2 "-argocd" suffix, e.g.
+            # loft-default-virtualcluster-llm-large-argocd.
+            - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES
+              value: "loft-{project}-virtualcluster-{virtualcluster},loft-{project}-vcluster-{virtualcluster}"
+            # The singular ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE still works and
+            # pins a single template if you need to override auto-detection.
+            # - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE
+            #   value: "loft-{project}-vcluster-{virtualcluster}"
             - name: WATCH_POLL_INTERVAL
               value: "2s"
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
@@ -66,6 +77,21 @@ spec:
             # Requires the VCI status patch RBAC from deploy/watcher-rbac.yaml.
             # - name: WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE
             #   value: "true"
+            # Optional: Argo CD REST API discovery/fallback. Only needed when
+            # cluster Secrets or Applications are NOT readable from this cluster
+            # (for example fully Akuity-hosted Argo CD). When set, the watcher
+            # can discover cluster name<->server mappings and list Applications
+            # via the API, but it never pauses via the API: if no patchable
+            # cluster Secret is found, pause is disabled and the watcher is
+            # limited to wake/refresh signals.
+            # - name: ARGOCD_API_BASE
+            #   value: "https://argocd.example.com"
+            # - name: ARGOCD_API_TOKEN_PATH
+            #   value: "/var/run/secrets/argocd/token"
+            # - name: ARGOCD_API_CA_PATH
+            #   value: "/var/run/secrets/argocd/ca.crt"
+            # - name: ARGOCD_API_INSECURE
+            #   value: "false"
           # Uncomment when using WATCH_WAKE_TOKEN_PATH with the example Secret above.
           # volumeMounts:
           #   - name: platform-token

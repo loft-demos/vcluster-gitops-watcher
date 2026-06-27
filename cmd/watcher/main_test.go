@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -11,6 +12,47 @@ import (
 	"testing"
 	"time"
 )
+
+// clusterSecretForTest builds an Argo CD cluster Secret as it would appear in
+// the index: a real metadata.name plus base64 data.name (and optional server).
+// For the legacy v1 layout, metadata.name equals data.name.
+func clusterSecretForTest(name, server string, paused bool) secret {
+	annotations := map[string]string{}
+	if paused {
+		annotations[argocdSkipReconcileAnnotation] = "true"
+	}
+	data := map[string]string{"name": base64.StdEncoding.EncodeToString([]byte(name))}
+	if server != "" {
+		data["server"] = base64.StdEncoding.EncodeToString([]byte(server))
+	}
+	return secret{
+		Metadata: metadata{Name: name, Annotations: annotations},
+		Data:     data,
+	}
+}
+
+// reconcileIndexForTest assembles a reconcileIndex from name-keyed Applications,
+// cluster Secrets, and optional Kargo triggers, mirroring what reconcileAll
+// builds once per pass.
+func reconcileIndexForTest(appsByName map[string][]application, secrets []secret, kargo map[string]kargoWakeTrigger) reconcileIndex {
+	if appsByName == nil {
+		appsByName = map[string][]application{}
+	}
+	return reconcileIndex{
+		appsByDestinationName:   appsByName,
+		appsByDestinationServer: applicationsByDestinationServer(flattenApps(appsByName)),
+		clusterSecrets:          buildClusterSecretIndex(secrets),
+		kargoWakeTriggers:       kargo,
+	}
+}
+
+func flattenApps(appsByName map[string][]application) []application {
+	var all []application
+	for _, apps := range appsByName {
+		all = append(all, apps...)
+	}
+	return all
+}
 
 func TestProjectFromVCIUsesProjectLabelFirst(t *testing.T) {
 	vci := virtualClusterInstance{
@@ -736,7 +778,7 @@ func TestReconcileVCITriggersWakeOncePerObservedSyncIntent(t *testing.T) {
 		},
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -760,14 +802,16 @@ func TestReconcileVCITriggersWakeOncePerObservedSyncIntent(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected one wake call after new sync intent, got %d", wakeCalls)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on second pass: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -816,7 +860,7 @@ func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
 		},
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -843,14 +887,16 @@ func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected one wake call after new refresh request, got %d", wakeCalls)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on second pass: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -858,7 +904,7 @@ func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
 	}
 
 	appsByDestination[secretName][0].Metadata.ResourceVersion = "3"
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on refreshed pass: %v", err)
 	}
 	if wakeCalls != 2 {
@@ -894,7 +940,7 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 		},
 		argocdApplicationNamespace:   "argocd",
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 		patchApplicationHealth:       true,
 		sleepingHealthMessage:        "vCluster sleeping",
@@ -927,14 +973,16 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if len(patched) != 1 {
 		t.Fatalf("expected one hard refresh patch on first ready reconcile, got %d", len(patched))
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on second pass: %v", err)
 	}
 	if len(patched) != 1 {
@@ -942,7 +990,7 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 	}
 
 	vci.Status = virtualClusterStatus{}
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error in unknown-state pass: %v", err)
 	}
 
@@ -952,7 +1000,7 @@ func TestReconcileVCIHardRefreshesReadyAppsOnlyOncePerReadyTransition(t *testing
 			{Type: virtualClusterOnlineConditionType, Status: "True"},
 		},
 	}
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error after re-entering ready: %v", err)
 	}
 	if len(patched) != 2 {
@@ -988,7 +1036,7 @@ func TestReconcileVCIRepausesIdleReadyClusterDespiteStaleRefreshAnnotation(t *te
 		},
 		argocdApplicationNamespace:   "argocd",
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 		patchApplicationHealth:       true,
 		sleepingHealthMessage:        "vCluster sleeping",
@@ -1027,7 +1075,9 @@ func TestReconcileVCIRepausesIdleReadyClusterDespiteStaleRefreshAnnotation(t *te
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if secretPatches != 1 {
@@ -1075,7 +1125,7 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 		},
 		argocdApplicationNamespace:   "argocd",
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 		patchApplicationHealth:       true,
 		sleepingHealthMessage:        "vCluster sleeping",
@@ -1108,7 +1158,9 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	// Rebuild the index each pass so it reflects the server-tracked pause state,
+	// mirroring reconcileAll listing cluster Secrets fresh on every poll.
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", secretPaused)}, nil)); err != nil {
 		t.Fatalf("unexpected reconcile error on first ready pass: %v", err)
 	}
 	if appPatches != 1 {
@@ -1118,7 +1170,7 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 		t.Fatalf("expected no secret patch on first ready pass, got %d", secretPatches)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", secretPaused)}, nil)); err != nil {
 		t.Fatalf("unexpected reconcile error on second ready pass: %v", err)
 	}
 	if appPatches != 1 {
@@ -1128,7 +1180,7 @@ func TestReconcileVCIRepausesIdleReadyClusterAfterOneManagedHealthRefresh(t *tes
 		t.Fatalf("expected one secret patch to re-pause idle ready cluster on second ready pass, got %d", secretPatches)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", secretPaused)}, nil)); err != nil {
 		t.Fatalf("unexpected reconcile error on third ready pass: %v", err)
 	}
 	if appPatches != 1 {
@@ -1165,7 +1217,7 @@ func TestReconcileVCIPausesUnknownStateClusterWhenIdle(t *testing.T) {
 		},
 		argocdApplicationNamespace:   "argocd",
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1177,7 +1229,9 @@ func TestReconcileVCIPausesUnknownStateClusterWhenIdle(t *testing.T) {
 		Status: virtualClusterStatus{},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, map[string][]application{secretName: nil}, nil); err != nil {
+	idx := reconcileIndexForTest(map[string][]application{secretName: nil}, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if secretPatches != 1 {
@@ -1220,7 +1274,7 @@ func TestReconcileVCIDoesNotRetryWakeFromStaleRefreshAnnotationAfterCooldown(t *
 		},
 		wakeRetryInterval:            time.Second,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1247,7 +1301,9 @@ func TestReconcileVCIDoesNotRetryWakeFromStaleRefreshAnnotationAfterCooldown(t *
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1255,7 +1311,7 @@ func TestReconcileVCIDoesNotRetryWakeFromStaleRefreshAnnotationAfterCooldown(t *
 	}
 
 	runtime.lastWakeAttempt[secretName] = time.Now().Add(-2 * time.Second)
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on stale refresh pass: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1292,7 +1348,7 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenSyncIntentPersists(t *testing.T
 		},
 		wakeRetryInterval:            time.Second,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1319,7 +1375,9 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenSyncIntentPersists(t *testing.T
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1368,7 +1426,7 @@ func TestReconcileVCITriggersWakeForNewOutOfSyncRevision(t *testing.T) {
 		},
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1395,14 +1453,16 @@ func TestReconcileVCITriggersWakeForNewOutOfSyncRevision(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
 		t.Fatalf("expected one wake call after new OutOfSync revision, got %d", wakeCalls)
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error on second pass: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1439,7 +1499,7 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenOutOfSyncRevisionPersists(t *te
 		},
 		wakeRetryInterval:            time.Second,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1469,7 +1529,9 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenOutOfSyncRevisionPersists(t *te
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1522,7 +1584,7 @@ func TestReconcileVCIUpdatesVCILastActivityOnWakeWhenEnabled(t *testing.T) {
 		updateVCILastActivityOnWake:  true,
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1546,7 +1608,9 @@ func TestReconcileVCIUpdatesVCILastActivityOnWakeWhenEnabled(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1611,7 +1675,7 @@ func TestReconcileVCIIgnoresVCILastActivityPatchFailure(t *testing.T) {
 		updateVCILastActivityOnWake:  true,
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 	runtime := newWatcherRuntime()
@@ -1635,7 +1699,9 @@ func TestReconcileVCIIgnoresVCILastActivityPatchFailure(t *testing.T) {
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, nil); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1675,7 +1741,7 @@ func TestReconcileVCITriggersWakeForActiveKargoPromotionBeforeSyncIntent(t *test
 		},
 		wakeRetryInterval:            time.Hour,
 		argocdClusterSecretNamespace: "argocd",
-		clusterSecretNameTemplate:    "loft-{project}-vcluster-{virtualcluster}",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
 		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
 	}
 
@@ -1713,7 +1779,9 @@ func TestReconcileVCITriggersWakeForActiveKargoPromotionBeforeSyncIntent(t *test
 		},
 	}
 
-	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, appsByDestination, kargoWakeTriggers); err != nil {
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, kargoWakeTriggers)
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
 		t.Fatalf("unexpected reconcile error: %v", err)
 	}
 	if wakeCalls != 1 {
@@ -1770,4 +1838,417 @@ func writeWatcherTestToken(t *testing.T) string {
 	}
 
 	return tokenFile.Name()
+}
+
+func b64(v string) string {
+	return base64.StdEncoding.EncodeToString([]byte(v))
+}
+
+// v2ClusterSecret builds an Argo CD v2 cluster Secret: auto-generated
+// metadata.name, but data.name/data.server carrying the platform cluster name
+// and tenant server URL.
+func v2ClusterSecret(metaName, dataName, server string) secret {
+	data := map[string]string{}
+	if dataName != "" {
+		data["name"] = b64(dataName)
+	}
+	if server != "" {
+		data["server"] = b64(server)
+	}
+	return secret{Metadata: metadata{Name: metaName}, Data: data}
+}
+
+func TestClusterSecretIndexResolvesV2VirtualclusterInfixByDataName(t *testing.T) {
+	const dataName = "loft-demo-virtualcluster-team-a"
+	secrets := []secret{
+		v2ClusterSecret("cluster-host-abc123", dataName, "https://team-a.platform.example.com"),
+	}
+	index := buildClusterSecretIndex(secrets)
+
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, "demo", "team-a")
+
+	resolved := index.resolve(expected, nil)
+	if resolved.secret == nil {
+		t.Fatalf("expected to resolve v2 secret by data.name, got nil")
+	}
+	if resolved.secretMetadataName() != "cluster-host-abc123" {
+		t.Fatalf("expected real metadata.name to be used for patching, got %q", resolved.secretMetadataName())
+	}
+	if resolved.clusterName != dataName {
+		t.Fatalf("expected resolved cluster name %q, got %q", dataName, resolved.clusterName)
+	}
+	if resolved.server != "https://team-a.platform.example.com" {
+		t.Fatalf("expected resolved server URL, got %q", resolved.server)
+	}
+}
+
+func TestClusterSecretIndexResolvesV2ArgocdSuffix(t *testing.T) {
+	// The v2 connector appends "-argocd" to the registered cluster name, e.g.
+	// vCluster "llm-large" in project "default".
+	const dataName = "loft-default-virtualcluster-llm-large-argocd"
+	secrets := []secret{
+		v2ClusterSecret("cluster-host-xyz", dataName, "https://llm-large.platform.example.com"),
+	}
+	index := buildClusterSecretIndex(secrets)
+
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, "default", "llm-large")
+
+	resolved := index.resolve(expected, nil)
+	if resolved.secret == nil {
+		t.Fatalf("expected to resolve v2 secret with -argocd suffix, got nil")
+	}
+	if resolved.secretMetadataName() != "cluster-host-xyz" {
+		t.Fatalf("expected real metadata.name for patching, got %q", resolved.secretMetadataName())
+	}
+	if resolved.clusterName != dataName {
+		t.Fatalf("expected resolved cluster name %q, got %q", dataName, resolved.clusterName)
+	}
+	if resolved.matchedViaPrefix {
+		t.Fatalf("expected an exact data.name match, not a prefix fallback")
+	}
+}
+
+func TestClusterSecretIndexResolvesLegacyVclusterInfixByDataName(t *testing.T) {
+	const dataName = "loft-demo-vcluster-team-a"
+	secrets := []secret{
+		// v1: metadata.name equals data.name.
+		clusterSecretForTest(dataName, "https://team-a.platform.example.com", false),
+	}
+	index := buildClusterSecretIndex(secrets)
+
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, "demo", "team-a")
+
+	resolved := index.resolve(expected, nil)
+	if resolved.secret == nil || resolved.clusterName != dataName {
+		t.Fatalf("expected to resolve legacy secret by data.name, got %+v", resolved)
+	}
+}
+
+func TestClusterSecretIndexResolvesByServerWhenOnlyServerMatches(t *testing.T) {
+	const server = "https://team-a.platform.example.com"
+	secrets := []secret{
+		// data.name does not match any template; only the server URL lines up.
+		v2ClusterSecret("cluster-host-zzz", "some-unexpected-cluster-name", server),
+	}
+	index := buildClusterSecretIndex(secrets)
+
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, "demo", "team-a")
+
+	resolved := index.resolve(expected, []string{server + "/"})
+	if resolved.secret == nil {
+		t.Fatalf("expected to resolve secret by server URL, got nil")
+	}
+	if resolved.secretMetadataName() != "cluster-host-zzz" {
+		t.Fatalf("expected metadata.name from server match, got %q", resolved.secretMetadataName())
+	}
+}
+
+func TestClusterSecretIndexNotFoundReturnsPrimaryExpectedName(t *testing.T) {
+	index := buildClusterSecretIndex(nil)
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, "demo", "team-a")
+
+	resolved := index.resolve(expected, nil)
+	if resolved.secret != nil {
+		t.Fatalf("expected no secret, got %+v", resolved.secret)
+	}
+	if resolved.secretMetadataName() != "" {
+		t.Fatalf("expected empty metadata.name when unresolved, got %q", resolved.secretMetadataName())
+	}
+	if resolved.clusterName != expected[0] {
+		t.Fatalf("expected fallback runtime key %q, got %q", expected[0], resolved.clusterName)
+	}
+}
+
+func TestClusterSecretIndexResolvesViaTruncatedPrefix(t *testing.T) {
+	longProject := strings.Repeat("p", 40)
+	templates := parseList(defaultClusterSecretNameTemplates)
+	expected := expandClusterSecretNames(templates, longProject, "team-a")
+
+	full := expected[0]
+	if len(full) <= clusterNameMaxLength {
+		t.Fatalf("test setup expected a name longer than %d, got %d", clusterNameMaxLength, len(full))
+	}
+	// Simulate the platform's SafeConcatNameMax truncation with a hash suffix.
+	truncated := full[:clusterNamePrefixMatchLength] + "-9f2a1"
+
+	index := buildClusterSecretIndex([]secret{v2ClusterSecret("cluster-host-trunc", truncated, "https://x")})
+
+	resolved := index.resolve(expected, nil)
+	if resolved.secret == nil || !resolved.matchedViaPrefix {
+		t.Fatalf("expected prefix-fallback match, got %+v", resolved)
+	}
+	if resolved.clusterName != truncated {
+		t.Fatalf("expected resolved cluster name %q, got %q", truncated, resolved.clusterName)
+	}
+}
+
+func TestApplicationsByDestinationServerIndexesByNormalizedServer(t *testing.T) {
+	apps := []application{
+		{
+			Metadata: metadata{Name: "guestbook-dev"},
+			Spec:     applicationSpec{Destination: applicationDestination{Server: "https://Team-A.Platform.Example.com/"}},
+		},
+		{
+			Metadata: metadata{Name: "akuity-app"},
+			Spec:     applicationSpec{Destination: applicationDestination{Name: "loft-demo-virtualcluster-team-a"}},
+		},
+	}
+
+	byServer := applicationsByDestinationServer(apps)
+	if got := len(byServer["https://team-a.platform.example.com"]); got != 1 {
+		t.Fatalf("expected one app indexed by normalized server, got %d", got)
+	}
+	// The Akuity app (name only, no server) must not be indexed by server.
+	if len(byServer) != 1 {
+		t.Fatalf("expected exactly one server key, got %d", len(byServer))
+	}
+}
+
+func TestNormalizeServerURLEquality(t *testing.T) {
+	tests := []struct {
+		left  string
+		right string
+	}{
+		{"https://Example.com/", "https://example.com"},
+		{"HTTPS://EXAMPLE.COM:443/", "https://example.com:443"},
+		{"https://example.com/path/", "https://example.com/path"},
+	}
+	for _, tt := range tests {
+		if normalizeServerURL(tt.left) != normalizeServerURL(tt.right) {
+			t.Fatalf("expected %q and %q to normalize equal, got %q vs %q", tt.left, tt.right, normalizeServerURL(tt.left), normalizeServerURL(tt.right))
+		}
+	}
+}
+
+func TestReconcileVCIMatchesPlainArgoCDV2ApplicationByServer(t *testing.T) {
+	const (
+		metaName = "cluster-host-abc123"
+		dataName = "loft-demo-virtualcluster-team-a"
+		server   = "https://team-a.platform.example.com"
+	)
+
+	var patchedSecrets []string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+metaName):
+			patchedSecrets = append(patchedSecrets, r.URL.Path)
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   parseList(defaultClusterSecretNameTemplates),
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+
+	// Plain Argo CD v2: Application targets the tenant cluster by server, not name.
+	app := application{
+		Metadata: metadata{Name: "guestbook"},
+		Spec:     applicationSpec{Destination: applicationDestination{Server: server}},
+	}
+	idx := reconcileIndex{
+		appsByDestinationName:   map[string][]application{},
+		appsByDestinationServer: applicationsByDestinationServer([]application{app}),
+		clusterSecrets:          buildClusterSecretIndex([]secret{v2ClusterSecret(metaName, dataName, server)}),
+		kargoWakeTriggers:       map[string]kargoWakeTrigger{},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patchedSecrets) != 1 {
+		t.Fatalf("expected the auto-named v2 secret to be paused once, got %d patches", len(patchedSecrets))
+	}
+}
+
+func TestReconcileVCIMatchesAkuityV2ApplicationByName(t *testing.T) {
+	const (
+		metaName = "cluster-host-akuity"
+		dataName = "loft-demo-virtualcluster-team-a"
+	)
+
+	patchedSecrets := 0
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+metaName) {
+			patchedSecrets++
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   parseList(defaultClusterSecretNameTemplates),
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+
+	// Akuity v2: Application targets the tenant cluster by name.
+	app := application{
+		Metadata: metadata{Name: "guestbook"},
+		Spec:     applicationSpec{Destination: applicationDestination{Name: dataName}},
+	}
+	idx := reconcileIndex{
+		appsByDestinationName:   applicationsByDestinationName([]application{app}),
+		appsByDestinationServer: map[string][]application{},
+		clusterSecrets:          buildClusterSecretIndex([]secret{v2ClusterSecret(metaName, dataName, "")}),
+		kargoWakeTriggers:       map[string]kargoWakeTrigger{},
+	}
+
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if patchedSecrets != 1 {
+		t.Fatalf("expected the Akuity v2 secret to be paused once, got %d patches", patchedSecrets)
+	}
+}
+
+func TestReconcileVCIWithoutPatchableSecretDoesNotClaimPause(t *testing.T) {
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Fatalf("did not expect any API call, got %s %s", r.Method, r.URL.Path)
+	}))
+	defer apiServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   parseList(defaultClusterSecretNameTemplates),
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+		patchApplicationHealth:       true,
+		sleepingHealthMessage:        "vCluster sleeping",
+		wakingHealthMessage:          "vCluster waking",
+	}
+	runtime := newWatcherRuntime()
+	vci := virtualClusterInstance{
+		Metadata: metadata{
+			Name:      "team-a",
+			Namespace: "p-demo",
+			Annotations: map[string]string{
+				sleepingSinceAnnotation: "1711800000",
+			},
+		},
+	}
+
+	// Discovery-only entry (no metadata.name) e.g. from the Argo CD REST API.
+	index := buildClusterSecretIndex(nil)
+	index.addDiscoveryCluster("loft-demo-virtualcluster-team-a", "https://team-a.platform.example.com")
+	idx := reconcileIndex{
+		appsByDestinationName:   map[string][]application{},
+		appsByDestinationServer: map[string][]application{},
+		clusterSecrets:          index,
+		kargoWakeTriggers:       map[string]kargoWakeTrigger{},
+	}
+
+	// No secret patch and no health patch must be attempted (apiServer t.Fatalf
+	// guards this). Pause is disabled because the Secret is not patchable.
+	if err := reconcileVCI(context.Background(), &cfg, runtime, vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+}
+
+func TestLoadWatcherConfigDefaultsToBothTemplates(t *testing.T) {
+	tokenPath := writeWatcherTestToken(t)
+
+	t.Setenv("WATCH_KUBERNETES_API", "http://127.0.0.1")
+	t.Setenv("WATCH_TOKEN_PATH", tokenPath)
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE", "")
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES", "")
+
+	cfg, err := loadWatcherConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading watcher config: %v", err)
+	}
+	want := []string{
+		"loft-{project}-virtualcluster-{virtualcluster}",
+		"loft-{project}-vcluster-{virtualcluster}",
+	}
+	if len(cfg.clusterSecretNameTemplates) != len(want) {
+		t.Fatalf("expected default templates %v, got %v", want, cfg.clusterSecretNameTemplates)
+	}
+	for i := range want {
+		if cfg.clusterSecretNameTemplates[i] != want[i] {
+			t.Fatalf("expected template %q at %d, got %q", want[i], i, cfg.clusterSecretNameTemplates[i])
+		}
+	}
+}
+
+func TestLoadWatcherConfigSingularTemplateStillPinsSingle(t *testing.T) {
+	tokenPath := writeWatcherTestToken(t)
+
+	t.Setenv("WATCH_KUBERNETES_API", "http://127.0.0.1")
+	t.Setenv("WATCH_TOKEN_PATH", tokenPath)
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE", "loft-{project}-vcluster-{virtualcluster}")
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES", "")
+
+	cfg, err := loadWatcherConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading watcher config: %v", err)
+	}
+	if len(cfg.clusterSecretNameTemplates) != 1 || cfg.clusterSecretNameTemplates[0] != "loft-{project}-vcluster-{virtualcluster}" {
+		t.Fatalf("expected singular template to pin a single entry, got %v", cfg.clusterSecretNameTemplates)
+	}
+}
+
+func TestLoadWatcherConfigPluralTemplatesSupersedeSingular(t *testing.T) {
+	tokenPath := writeWatcherTestToken(t)
+
+	t.Setenv("WATCH_KUBERNETES_API", "http://127.0.0.1")
+	t.Setenv("WATCH_TOKEN_PATH", tokenPath)
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE", "loft-{project}-vcluster-{virtualcluster}")
+	t.Setenv("ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES", "a-{project}-{virtualcluster},b-{project}-{virtualcluster}")
+
+	cfg, err := loadWatcherConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading watcher config: %v", err)
+	}
+	if len(cfg.clusterSecretNameTemplates) != 2 || cfg.clusterSecretNameTemplates[0] != "a-{project}-{virtualcluster}" {
+		t.Fatalf("expected plural templates to win, got %v", cfg.clusterSecretNameTemplates)
+	}
 }
