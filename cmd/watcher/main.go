@@ -37,6 +37,8 @@ const (
 	defaultKubernetesServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultKubernetesServiceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	defaultWakeRetryInterval                 = 30 * time.Second
+	defaultKubernetesListPageSize            = 50
+	maxAPIResponseBodyBytes                  = 16 << 20
 
 	argocdClusterSecretTypeLabelSelector = "argocd.argoproj.io/secret-type=cluster"
 
@@ -409,7 +411,12 @@ func normalizeServerURL(raw string) string {
 }
 
 type listResponse[T any] struct {
-	Items []T `json:"items"`
+	Metadata listMetadata `json:"metadata"`
+	Items    []T          `json:"items"`
+}
+
+type listMetadata struct {
+	Continue string `json:"continue"`
 }
 
 type apiStatusError struct {
@@ -426,6 +433,17 @@ func (e *apiStatusError) Error() string {
 		return e.Status
 	}
 	return fmt.Sprintf("%s: %s", e.Status, e.Body)
+}
+
+func readResponseBody(body io.Reader, maxBytes int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("response body exceeds %d bytes", maxBytes)
+	}
+	return data, nil
 }
 
 func mustEnv(key, def string) string {
@@ -658,7 +676,7 @@ func (c *argoCDAPIClient) getJSON(ctx context.Context, path string, out any) err
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := readResponseBody(resp.Body, maxAPIResponseBodyBytes)
 	if err != nil {
 		return err
 	}
@@ -918,7 +936,7 @@ func (a *kubernetesAPI) request(ctx context.Context, method, path string, query 
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := readResponseBody(resp.Body, maxAPIResponseBodyBytes)
 	if err != nil {
 		return nil, err
 	}
@@ -944,6 +962,43 @@ func (a *kubernetesAPI) getJSON(ctx context.Context, path string, query url.Valu
 	return nil
 }
 
+func listKubernetesResources[T any](ctx context.Context, api *kubernetesAPI, path string, query url.Values) ([]T, error) {
+	baseQuery := url.Values{}
+	for key, values := range query {
+		baseQuery[key] = append([]string(nil), values...)
+	}
+
+	var items []T
+	continueToken := ""
+	seenContinueTokens := map[string]struct{}{}
+	for {
+		pageQuery := url.Values{}
+		for key, values := range baseQuery {
+			pageQuery[key] = append([]string(nil), values...)
+		}
+		pageQuery.Set("limit", fmt.Sprintf("%d", defaultKubernetesListPageSize))
+		if continueToken != "" {
+			pageQuery.Set("continue", continueToken)
+		}
+
+		var page listResponse[T]
+		if err := api.getJSON(ctx, path, pageQuery, &page); err != nil {
+			return nil, err
+		}
+		items = append(items, page.Items...)
+
+		next := strings.TrimSpace(page.Metadata.Continue)
+		if next == "" {
+			return items, nil
+		}
+		if _, exists := seenContinueTokens[next]; exists {
+			return nil, fmt.Errorf("Kubernetes list returned repeated continue token %q", next)
+		}
+		seenContinueTokens[next] = struct{}{}
+		continueToken = next
+	}
+}
+
 func (a *kubernetesAPI) mergePatch(ctx context.Context, path string, payload any) error {
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -954,44 +1009,43 @@ func (a *kubernetesAPI) mergePatch(ctx context.Context, path string, payload any
 }
 
 func (a *kubernetesAPI) listVirtualClusterInstances(ctx context.Context) ([]virtualClusterInstance, error) {
-	var out listResponse[virtualClusterInstance]
-	if err := a.getJSON(ctx, "/apis/management.loft.sh/v1/virtualclusterinstances", nil, &out); err != nil {
+	items, err := listKubernetesResources[virtualClusterInstance](ctx, a, "/apis/management.loft.sh/v1/virtualclusterinstances", nil)
+	if err != nil {
 		return nil, err
 	}
-	sort.Slice(out.Items, func(i, j int) bool {
-		left := out.Items[i].Metadata.Namespace + "/" + out.Items[i].Metadata.Name
-		right := out.Items[j].Metadata.Namespace + "/" + out.Items[j].Metadata.Name
+	sort.Slice(items, func(i, j int) bool {
+		left := items[i].Metadata.Namespace + "/" + items[i].Metadata.Name
+		right := items[j].Metadata.Namespace + "/" + items[j].Metadata.Name
 		return left < right
 	})
-	return out.Items, nil
+	return items, nil
 }
 
 func (a *kubernetesAPI) listApplications(ctx context.Context, namespace string) ([]application, error) {
-	var out listResponse[application]
-
 	path := "/apis/argoproj.io/v1alpha1/namespaces/" + url.PathEscape(namespace) + "/applications"
-	if err := a.getJSON(ctx, path, nil, &out); err != nil {
+	items, err := listKubernetesResources[application](ctx, a, path, nil)
+	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(out.Items, func(i, j int) bool {
-		return out.Items[i].Metadata.Name < out.Items[j].Metadata.Name
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Metadata.Name < items[j].Metadata.Name
 	})
-	return out.Items, nil
+	return items, nil
 }
 
 func (a *kubernetesAPI) listPromotions(ctx context.Context) ([]promotion, error) {
-	var out listResponse[promotion]
-	if err := a.getJSON(ctx, "/apis/kargo.akuity.io/v1alpha1/promotions", nil, &out); err != nil {
+	items, err := listKubernetesResources[promotion](ctx, a, "/apis/kargo.akuity.io/v1alpha1/promotions", nil)
+	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(out.Items, func(i, j int) bool {
-		left := out.Items[i].Metadata.Namespace + "/" + out.Items[i].Metadata.Name
-		right := out.Items[j].Metadata.Namespace + "/" + out.Items[j].Metadata.Name
+	sort.Slice(items, func(i, j int) bool {
+		left := items[i].Metadata.Namespace + "/" + items[i].Metadata.Name
+		right := items[j].Metadata.Namespace + "/" + items[j].Metadata.Name
 		return left < right
 	})
-	return out.Items, nil
+	return items, nil
 }
 
 func applicationsByDestinationName(apps []application) map[string][]application {
@@ -1209,19 +1263,19 @@ func (a *kubernetesAPI) getApplication(ctx context.Context, namespace, name stri
 // platform-created Secrets and the v2 API-registered Secrets carry this label
 // along with data.name and data.server, so a single list discovers either.
 func (a *kubernetesAPI) listClusterSecrets(ctx context.Context, namespace string) ([]secret, error) {
-	var out listResponse[secret]
 	query := url.Values{}
 	query.Set("labelSelector", argocdClusterSecretTypeLabelSelector)
 
 	path := "/api/v1/namespaces/" + url.PathEscape(namespace) + "/secrets"
-	if err := a.getJSON(ctx, path, query, &out); err != nil {
+	items, err := listKubernetesResources[secret](ctx, a, path, query)
+	if err != nil {
 		return nil, err
 	}
 
-	sort.Slice(out.Items, func(i, j int) bool {
-		return out.Items[i].Metadata.Name < out.Items[j].Metadata.Name
+	sort.Slice(items, func(i, j int) bool {
+		return items[i].Metadata.Name < items[j].Metadata.Name
 	})
-	return out.Items, nil
+	return items, nil
 }
 
 func (a *kubernetesAPI) getSecret(ctx context.Context, namespace, name string) (*secret, error) {

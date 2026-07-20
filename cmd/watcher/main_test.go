@@ -560,6 +560,67 @@ func TestLoadWatcherConfigBuildsWakeRequesterWhenConfigured(t *testing.T) {
 	}
 }
 
+func TestListApplicationsPaginatesResponsesLargerThanOneMiB(t *testing.T) {
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if r.URL.Path != "/apis/argoproj.io/v1alpha1/namespaces/argocd/applications" {
+			t.Fatalf("unexpected request path %q", r.URL.Path)
+		}
+		if got := r.URL.Query().Get("limit"); got != "50" {
+			t.Fatalf("expected page limit 50, got %q", got)
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Query().Get("continue") {
+		case "":
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"continue": "page-2"},
+				"items": []any{map[string]any{
+					"metadata": map[string]any{"name": "large-app"},
+					"padding":  strings.Repeat("x", (1<<20)+1024),
+				}},
+			}); err != nil {
+				t.Fatalf("encode first page: %v", err)
+			}
+		case "page-2":
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"metadata": map[string]any{"continue": ""},
+				"items": []any{map[string]any{
+					"metadata": map[string]any{"name": "small-app"},
+				}},
+			}); err != nil {
+				t.Fatalf("encode second page: %v", err)
+			}
+		default:
+			t.Fatalf("unexpected continue token %q", r.URL.Query().Get("continue"))
+		}
+	}))
+	defer server.Close()
+
+	api := &kubernetesAPI{client: server.Client(), apiBase: server.URL, bearerToken: "token"}
+	apps, err := api.listApplications(context.Background(), "argocd")
+	if err != nil {
+		t.Fatalf("list applications: %v", err)
+	}
+	if requestCount != 2 {
+		t.Fatalf("expected two paginated requests, got %d", requestCount)
+	}
+	if len(apps) != 2 || apps[0].Metadata.Name != "large-app" || apps[1].Metadata.Name != "small-app" {
+		t.Fatalf("unexpected applications: %#v", apps)
+	}
+}
+
+func TestReadResponseBodyReportsOverflow(t *testing.T) {
+	_, err := readResponseBody(strings.NewReader("12345"), 4)
+	if err == nil {
+		t.Fatal("expected an explicit response-size error")
+	}
+	if !strings.Contains(err.Error(), "response body exceeds 4 bytes") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestApplicationsByDestinationName(t *testing.T) {
 	apps := []application{
 		{

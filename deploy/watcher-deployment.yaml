@@ -31,7 +31,7 @@ spec:
       serviceAccountName: vcluster-gitops-watcher
       containers:
         - name: watcher
-          image: ghcr.io/your-org/vcluster-gitops-watcher:latest
+          image: ghcr.io/loft-demos/vcluster-gitops-watcher:1.3.0-rc.0
           imagePullPolicy: IfNotPresent
           env:
             - name: ARGOCD_NAMESPACE

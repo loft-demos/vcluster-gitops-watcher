@@ -1,5 +1,19 @@
 # Release Notes
 
+## 1.3.0-rc.0
+
+### Large Kubernetes List Reliability
+
+- Kubernetes list requests for VirtualClusterInstances, Argo CD Applications,
+  Kargo Promotions, and Argo CD cluster Secrets now use server-side pagination.
+- API response bodies are no longer silently truncated at 1 MiB. Responses are
+  accepted up to 16 MiB per page/request, and an explicit size error is returned
+  if that safety limit is exceeded.
+- This fixes continuous `unexpected end of JSON input` reconcile failures once
+  Argo CD Application specs and statuses make the ApplicationList exceed 1 MiB.
+- Added regression coverage for multi-page Application lists whose combined JSON
+  payload exceeds the former limit.
+
 ## Dual v1 / v2 Argo CD Integration Support (Watcher)
 
 `vcluster-gitops-watcher` now supports both the legacy (v1) Argo CD integration, where vCluster Platform creates the cluster Secret with a predictable name, and the v2 ("connector") integration, where the platform registers the cluster through the Argo CD REST API and Argo CD auto-generates the Secret `metadata.name`. Detection is automatic; operators do not pick a mode.
