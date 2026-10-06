@@ -1,0 +1,10 @@
+# Only with user-selected-projects.yaml. Not a standalone Project: add this
+# entry to the existing spec.members of each project whose tenant clusters the
+# watcher should wake. Applying a Project with only this member would replace
+# its other members.
+spec:
+  members:
+    - kind: User
+      group: storage.loft.sh
+      name: gitops-watcher
+      clusterRole: gitops-watcher-wake

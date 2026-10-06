@@ -12,9 +12,18 @@ rules:
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
     verbs: ["get", "list", "watch"]
+  # Only needed for WATCH_WAKE_DEFAULT=sync or the wake: "sync" annotation,
+  # which set sleepmode.loft.sh/force on a VCI after its deploy finishes.
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances"]
+    verbs: ["patch"]
   - apiGroups: ["kargo.akuity.io"]
     resources: ["promotions"]
     verbs: ["get", "list", "watch"]
+  # Sleep after sync waits for the Kargo Stage to be Ready (verified).
+  - apiGroups: ["kargo.akuity.io"]
+    resources: ["stages"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -52,31 +61,31 @@ roleRef:
   name: vcluster-gitops-watcher-vci-status-patch
 ---
 # Optional: only for WATCH_WAKE_ACCESS_KEY_USER / WATCH_WAKE_ACCESS_KEY_TEAM,
-# where the watcher creates its own wake AccessKey. create cannot be limited
-# by name, so this lets the watcher mint keys for any Platform user. Replace
-# gitops-watcher with the configured user (or use teams for a team).
+# where the watcher gets short-lived wake tokens by impersonating that Platform
+# user. Replace gitops-watcher with the configured user. For a team, use
+# "loft:team:<team>" as both the user and the group name.
 #
 # apiVersion: rbac.authorization.k8s.io/v1
 # kind: ClusterRole
 # metadata:
-#   name: vcluster-gitops-watcher-wake-accesskey
+#   name: vcluster-gitops-watcher-wake-tokens
 # rules:
-#   - apiGroups: ["storage.loft.sh"]
-#     resources: ["accesskeys"]
-#     verbs: ["create"]
-#   - apiGroups: ["storage.loft.sh"]
-#     resources: ["accesskeys"]
-#     resourceNames: ["vcluster-gitops-watcher-wake"]
-#     verbs: ["get", "patch"]
-#   - apiGroups: ["storage.loft.sh"]
+#   - apiGroups: [""]
 #     resources: ["users"]
 #     resourceNames: ["gitops-watcher"]
-#     verbs: ["get"]
+#     verbs: ["impersonate"]
+#   - apiGroups: [""]
+#     resources: ["groups"]
+#     resourceNames: ["loft:user:gitops-watcher"]
+#     verbs: ["impersonate"]
+#   - apiGroups: ["management.loft.sh"]
+#     resources: ["virtualclusterinstances/kubeconfig"]
+#     verbs: ["create"]
 # ---
 # apiVersion: rbac.authorization.k8s.io/v1
 # kind: ClusterRoleBinding
 # metadata:
-#   name: vcluster-gitops-watcher-wake-accesskey
+#   name: vcluster-gitops-watcher-wake-tokens
 # subjects:
 #   - kind: ServiceAccount
 #     name: vcluster-gitops-watcher
@@ -84,7 +93,7 @@ roleRef:
 # roleRef:
 #   apiGroup: rbac.authorization.k8s.io
 #   kind: ClusterRole
-#   name: vcluster-gitops-watcher-wake-accesskey
+#   name: vcluster-gitops-watcher-wake-tokens
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role

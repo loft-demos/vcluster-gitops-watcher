@@ -10,7 +10,7 @@ can also install the optional `vcluster-wakeup-proxy`.
 ```bash
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.0.0-rc.1 \
+  --version 2.1.0-rc.1 \
   --namespace argocd
 ```
 
@@ -41,16 +41,18 @@ kubectl -n argocd create secret generic vcluster-platform-token \
 
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.0.0-rc.1 \
+  --version 2.1.0-rc.1 \
   --namespace argocd \
   --set watcher.platformHost=platform.example.com \
   --set watcher.wake.upstreamBase=https://platform.example.com \
   --set watcher.wake.existingSecret=vcluster-platform-token
 ```
 
-Or let the watcher create and maintain its own access key. Set the vCluster
-Platform user (or team) the key acts as; it needs access to the tenant clusters
-it wakes:
+Or let the watcher get a short-lived wake token per tenant cluster from vCluster
+Platform, by impersonating a Platform user (or team) that has access to the
+tenant clusters it wakes. See
+[Wake User](../README.md#wake-user) for a least-privilege `gitops-watcher` user
+that covers every project without per-project setup:
 
 ```bash
   --set watcher.platformHost=platform.example.com \
@@ -58,14 +60,14 @@ it wakes:
   --set watcher.wake.accessKey.user=gitops-watcher
 ```
 
-The watcher creates a `storage.loft.sh/v1` AccessKey named
-`vcluster-gitops-watcher-wake`, scoped to `watcher.wake.accessKey.projects`, and
-recreates or repairs it if it is deleted, disabled, or edited. It refuses to take
-over an existing AccessKey with that name that it did not create. To use it,
-the chart grants the watcher `create` on `accesskeys.storage.loft.sh`.
-Kubernetes RBAC cannot restrict `create` by name, so this permission can mint
-keys for any Platform user. Treat the watcher's ServiceAccount accordingly, or
-use `existingSecret`. Uninstalling the chart does not delete the AccessKey:
+Each token covers one tenant cluster and expires after
+`watcher.wake.accessKey.tokenTTL` (default `10m`); vCluster Platform deletes the
+AccessKey behind it once it expires. The chart grants the watcher `impersonate`
+on only that user and its `loft:user:<name>` group, plus `create` on
+`virtualclusterinstances/kubeconfig`. The watcher never creates AccessKeys.
+
+Upgrading from 2.0.0-rc.1, which created a long-lived AccessKey instead: delete
+it once the new release is running.
 
 ```bash
 kubectl delete accesskeys.storage.loft.sh vcluster-gitops-watcher-wake
@@ -102,11 +104,16 @@ Secret is still required with `useProxy`.
 | `watcher.projectNamespacePrefixes` | `[p-, loft-p-]` | Prefixes used when no `loft.sh/project` label is present |
 | `watcher.patchApplicationHealth` | `true` | Patch non-Kargo app health while the destination sleeps |
 | `watcher.kargo.enabled` | `true` | Grant read access to Kargo `Promotion` objects |
+| `watcher.wake.default` | `enabled` | `enabled` wakes every VCI unless annotated `<annotationPrefix>/wake: "false"`; `disabled` wakes only VCIs annotated `"true"` or `"sync"`; `sync` wakes, deploys, and puts the VCI back to sleep |
+| `watcher.wake.sleepAfterSync.timeout` | `15m` | `sync` mode: give up putting the VCI back to sleep if the deploy is not done by then |
+| `watcher.wake.sleepAfterSync.settle` | `1m` | `sync` mode: minimum time after the VCI is ready before the deploy can count as done |
+| `watcher.wake.sleepAfterSync.subject` | derived | `sync` mode: sleep-mode subject of the wake credential; set it when using `existingSecret` |
+| `watcher.annotationPrefix` | `gitops-watcher.loft-demos.github.io` | DNS prefix of the watcher's VCI annotations |
 | `watcher.wake.upstreamBase` | empty | vCluster Platform base URL; empty disables wake requests |
 | `watcher.wake.useProxy` | `false` | Send wake requests to the bundled proxy Service |
 | `watcher.wake.existingSecret` | empty | Secret holding a dedicated Platform access key (`tokenKey`), never the Argo CD integration key |
-| `watcher.wake.accessKey.user` / `.team` | empty | Let the watcher create its own wake AccessKey acting as this Platform user or team, in place of `existingSecret` |
-| `watcher.wake.accessKey.projects` | `["*"]` | Projects the managed wake AccessKey is scoped to |
+| `watcher.wake.accessKey.user` / `.team` | empty | Get short-lived per-tenant-cluster wake tokens by impersonating this Platform user or team, in place of `existingSecret` |
+| `watcher.wake.accessKey.tokenTTL` | `10m` | Lifetime of each wake token; minimum `1m` |
 | `watcher.wake.updateVCILastActivity` | `false` | Patch VCI sleep `lastActivity` after a wake; adds the status RBAC |
 | `watcher.extraEnv` | `[]` | Any other watcher variable from the main README |
 | `proxy.enabled` | `false` | Install `vcluster-wakeup-proxy` |

@@ -1,5 +1,70 @@
 # Release Notes
 
+## 2.1.0-rc.1
+
+This release gives you control over which tenant clusters the watcher wakes, adds a mode that wakes a tenant cluster for a deploy and puts it straight back to sleep afterwards, and replaces the managed wake access key with short-lived tokens that need far fewer permissions.
+
+### Highlights
+
+- **Choose which VCIs to wake.** Wake every VCI by default and opt individual ones out, or wake none by default and opt individual ones in.
+- **Sleep after sync.** A new `sync` mode wakes a sleeping VCI for a deploy and puts it straight back to sleep once the deploy is done, unless someone else used it meanwhile.
+- **Least-privilege wake user.** The wake request now works for a user with no access inside tenant clusters, and the README shows a `gitops-watcher` user and project role with only the two permissions a wake needs.
+- **Short-lived wake tokens.** `WATCH_WAKE_ACCESS_KEY_USER` / `_TEAM` no longer create a long-lived AccessKey. The watcher now impersonates that Platform user to get a token per tenant cluster that expires after minutes, and no longer needs permission to create AccessKeys for any user.
+
+### Choosing Which VCIs to Wake
+
+- New `WATCH_WAKE_DEFAULT`: `enabled` (the default, unchanged behavior) wakes every sleeping VCI with pending GitOps work; `disabled` wakes none; `sync` wakes, deploys, and puts the VCI back to sleep.
+- The per-VCI annotation `gitops-watcher.loft-demos.github.io/wake` overrides it with `"true"`, `"false"`, or `"sync"`.
+- A VCI that is not woken is still paused while it sleeps and shows `Suspended` in Argo CD. Its pending syncs run once it is woken some other way.
+- An invalid annotation value is logged once and the global mode applies.
+- The annotation prefix is configurable with `WATCH_ANNOTATION_PREFIX` for forks.
+- In the chart: `watcher.wake.default` and `watcher.annotationPrefix`.
+
+### Sleep After Sync
+
+In `sync` mode (`WATCH_WAKE_DEFAULT=sync` or the annotation `gitops-watcher.loft-demos.github.io/wake: "sync"`), the watcher wakes a sleeping VCI for pending GitOps work, then waits until the deploy is done. That means every matching Application is `Synced` and `Healthy` with nothing pending, and any Kargo Stage is `Ready` (verified). If nobody else used the tenant cluster since the wake, the watcher sets `sleepmode.loft.sh/force: "true"` and it goes straight back to sleep. If someone else did, it is left to the normal sleep timer.
+
+- `WATCH_SLEEP_AFTER_SYNC_TIMEOUT` (default `15m`): give up and leave the normal sleep timer in charge if the deploy is not done by then.
+- `WATCH_SLEEP_AFTER_SYNC_SETTLE` (default `1m`): minimum time after the VCI is ready before the deploy can count as done.
+- `WATCH_WAKE_SUBJECT`: the wake credential's sleep-mode subject, derived automatically from the managed wake access key. Use a dedicated wake user so the watcher can tell its own activity from real users.
+- In the chart: `watcher.wake.default: sync` and `watcher.wake.sleepAfterSync.*`.
+
+### Short-Lived Wake Tokens
+
+In 2.0.0-rc.1, setting `WATCH_WAKE_ACCESS_KEY_USER` (or `_TEAM`) made the watcher create and maintain a long-lived `vcluster-gitops-watcher-wake` AccessKey. That needed `create` on `accesskeys.storage.loft.sh`, which Kubernetes RBAC cannot limit by name, so the watcher's ServiceAccount could mint keys for any Platform user, including admins.
+
+The same settings now work differently:
+
+- For each wake, the watcher requests a token kubeconfig for that one VCI (`virtualclusterinstances/<name>/kubeconfig`) while impersonating the configured user or team, and sends the wake request with its token.
+- Each token covers a single tenant cluster and expires after `WATCH_WAKE_TOKEN_TTL` (default `10m`). vCluster Platform creates the AccessKey behind it and deletes it once it expires.
+- Tokens are cached per tenant cluster, renewed shortly before they expire, and replaced after a `401`.
+- The watcher needs only `impersonate` on that one user and its `loft:user:<name>` group (or `loft:team:<name>`), both limited by name, and `create` on `virtualclusterinstances/kubeconfig`. It no longer creates, reads, or patches AccessKeys.
+- `sync` mode still derives the wake subject (`loft:user:<name>`) automatically.
+- In the chart: `watcher.wake.accessKey.user` / `.team` are unchanged; `watcher.wake.accessKey.tokenTTL` is new. `WATCH_WAKE_ACCESS_KEY_NAME` / `_PROJECTS` and `watcher.wake.accessKey.name` / `.projects` are no longer used.
+
+### Wake Request and Wake User
+
+- The watcher now sends `GET /kubernetes/project/<project>/virtualcluster/<name>/version` to wake a tenant cluster, instead of `POST /kubernetes/project/<project>/virtualcluster/<name>`. vCluster Platform forwards the wake request into the tenant cluster once it is ready, and a `POST /` there needed permissions inside the tenant cluster. Every authenticated user may read `/version`, so the wake user needs none.
+- A wake request that times out while vCluster Platform holds it for the starting tenant cluster now counts as triggered instead of failed. Platform starts the wake as soon as the request arrives. This also lets `sync` mode track wakes that take longer than `WATCH_WAKE_TIMEOUT`.
+- The bundled `vcluster-wakeup-proxy` treats this `GET .../version` as a wake request too, so `useProxy` keeps its accepted-status handling.
+- New README section "Wake User": a `gitops-watcher` Platform user with no password and a `gitops-watcher-wake` role granting only `use` on `virtualclusterinstances` and `create` on `virtualclusterinstances/kubeconfig`. Bound through the user's `spec.clusterRoles`, it covers every project with no per-project setup; adding the user to selected projects' `spec.members` instead limits it to those projects.
+
+### Upgrade Notes
+
+- **No behavior change by default.** Without `WATCH_WAKE_DEFAULT` or the wake annotation, the watcher wakes every sleeping VCI with pending GitOps work, as in 2.0.0-rc.1.
+- **New RBAC for `sync` mode:** `patch` on `virtualclusterinstances` and `get` on Kargo `stages`. The chart grants the VCI `patch` whenever wake requests are configured, since any VCI can opt in with the annotation, and grants `get` on Stages whenever Kargo support is enabled. The rules are also in `deploy/watcher-rbac.yaml`.
+- **If you used the managed wake access key from 2.0.0-rc.1:** no configuration change is needed. Once the new release is running, delete the old AccessKey with `kubectl delete accesskeys.storage.loft.sh vcluster-gitops-watcher-wake`. The chart replaces the AccessKey permissions with the impersonation rules automatically. With the plain manifests, swap the commented `vcluster-gitops-watcher-wake-accesskey` ClusterRole for `vcluster-gitops-watcher-wake-tokens` from `deploy/watcher-rbac.yaml`.
+- **The wake user must be able to use the tenant clusters it wakes**, as before. The tokens are scoped to that user's own Platform permissions. To replace a broad user such as `admin`, follow "Wake User" in the README.
+- **Wake requests changed shape.** Anything that inspects the watcher's wake traffic, such as an upstream proxy or audit rule matching `POST .../virtualcluster/<name>`, needs to match `GET .../virtualcluster/<name>/version` as well.
+- **Correction to the 2.0.0-rc.1 notes:** vCluster Platform ignores Argo CD integration traffic for sleep mode from v4.10.6, v4.11.0, and v4.12.0, not only v4.12.0. The wake token and `ignore-user-agents` guidance in those notes applies to all of these versions.
+
+### Documentation
+
+- New README section "Choosing Which VCIs to Wake" with the mode table and an example, and "Sleep After Sync".
+- New README section "Wake User", with standalone manifests in `examples/wake-user`.
+- The README's "Managed Wake Access Key" section is replaced by "Short-Lived Wake Tokens".
+- The example manifests document `WATCH_WAKE_DEFAULT`, the `sync` mode RBAC, and the wake token RBAC.
+
 ## 2.0.0-rc.1
 
 This release makes the watcher match vCluster Platform's v2 ("connector") Argo CD integration exactly, lets it create its own wake credentials, and ships it as a Helm chart. It targets vCluster Platform v4.12.0 and later, where Argo CD can no longer wake a sleeping tenant cluster and the watcher becomes the GitOps wake path.

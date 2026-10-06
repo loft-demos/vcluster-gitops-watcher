@@ -76,6 +76,26 @@ spec:
             - name: WATCH_PLATFORM_HOST
               value: {{ . | quote }}
             {{- end }}
+            {{- with .Values.watcher.annotationPrefix }}
+            - name: WATCH_ANNOTATION_PREFIX
+              value: {{ . | quote }}
+            {{- end }}
+            - name: WATCH_WAKE_DEFAULT
+              value: {{ .Values.watcher.wake.default | default "enabled" | quote }}
+            {{- with .Values.watcher.wake.sleepAfterSync }}
+            {{- with .timeout }}
+            - name: WATCH_SLEEP_AFTER_SYNC_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .settle }}
+            - name: WATCH_SLEEP_AFTER_SYNC_SETTLE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .subject }}
+            - name: WATCH_WAKE_SUBJECT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
             - name: WATCH_POLL_INTERVAL
               value: {{ .Values.watcher.pollInterval | quote }}
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
@@ -118,10 +138,10 @@ spec:
             - name: WATCH_WAKE_ACCESS_KEY_TEAM
               value: {{ . | quote }}
             {{- end }}
-            - name: WATCH_WAKE_ACCESS_KEY_NAME
-              value: {{ $accessKey.name | quote }}
-            - name: WATCH_WAKE_ACCESS_KEY_PROJECTS
-              value: {{ join "," $accessKey.projects | quote }}
+            {{- with $accessKey.tokenTTL }}
+            - name: WATCH_WAKE_TOKEN_TTL
+              value: {{ . | quote }}
+            {{- end }}
             {{- end }}
             - name: WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE
               value: {{ .Values.watcher.wake.updateVCILastActivity | quote }}

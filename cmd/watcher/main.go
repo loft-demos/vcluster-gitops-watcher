@@ -68,6 +68,13 @@ const (
 	// legacy v1 infix.
 	defaultClusterSecretNameTemplates = "loft-{project}-virtualcluster-{virtualcluster},loft-{project}-vcluster-{virtualcluster}"
 
+	// defaultAnnotationPrefix is the domain prefix for the watcher's own
+	// VirtualClusterInstance annotations. WATCH_ANNOTATION_PREFIX overrides it.
+	defaultAnnotationPrefix = "gitops-watcher.loft-demos.github.io"
+	// wakeAnnotationName, under the annotation prefix, overrides
+	// WATCH_WAKE_DEFAULT for one VirtualClusterInstance: "true" or "false".
+	wakeAnnotationName = "wake"
+
 	// argocdClusterNameSuffix is appended by the v2 ("connector") registration
 	// to the Argo CD cluster name (the Secret data.name), for example
 	// loft-default-virtualcluster-llm-large-argocd. Each expanded template is
@@ -102,7 +109,19 @@ type watcherConfig struct {
 	// (scheme://host). When set, it derives each tenant cluster's Argo CD
 	// server URL and restricts label and fallback matches to Secrets that
 	// point at this platform.
-	platformHost                string
+	platformHost string
+	// wakeDefault is WATCH_WAKE_DEFAULT: the wake mode for VCIs without the
+	// wake annotation. The zero value means wakeModeOn, the original behavior.
+	wakeDefault wakeMode
+	// wakeSubject is the sleep-mode activity subject of the wake credential,
+	// for example loft:user:gitops-watcher. Used by wakeModeSync to tell the
+	// watcher's own activity apart from everyone else's.
+	wakeSubject string
+	// sleepAfterSyncTimeout and sleepAfterSyncSettle tune wakeModeSync.
+	sleepAfterSyncTimeout time.Duration
+	sleepAfterSyncSettle  time.Duration
+	// annotationPrefix is the domain prefix of the watcher's VCI annotations.
+	annotationPrefix            string
 	argoCDAPI                   *argoCDAPIClient
 	updateVCILastActivityOnWake bool
 	patchApplicationHealth      bool
@@ -127,9 +146,9 @@ type wakeRequester struct {
 	baseURL          string
 	bearerToken      string
 	acceptedStatuses map[int]struct{}
-	// accessKey, when set, supplies the bearer token from a platform
-	// AccessKey the watcher manages itself, in place of bearerToken.
-	accessKey *wakeAccessKeyManager
+	// tokens, when set, supplies short-lived per-VCI tokens issued by
+	// vCluster Platform for an impersonated user, in place of bearerToken.
+	tokens *wakeTokenIssuer
 }
 
 type watcherRuntime struct {
@@ -142,6 +161,9 @@ type watcherRuntime struct {
 	lastKnownKargoHealth     map[string]healthStatus
 	prefixMatchLogged        map[string]bool
 	ambiguousMatchLogged     map[string]bool
+	wakeSuppressedLogged     map[string]bool
+	sleepAfterSync           map[string]*sleepAfterSyncState
+	invalidWakeLogged        map[string]bool
 	pauseDisabledLogged      map[string]bool
 	kargoPromotionsChecked   bool
 	kargoPromotionsAvailable bool
@@ -163,11 +185,12 @@ type condition struct {
 }
 
 type virtualClusterStatus struct {
-	Phase      string      `json:"phase"`
-	Reason     string      `json:"reason"`
-	Message    string      `json:"message"`
-	Online     *bool       `json:"online"`
-	Conditions []condition `json:"conditions"`
+	Phase           string              `json:"phase"`
+	SleepModeConfig *vciSleepModeConfig `json:"sleepModeConfig,omitempty"`
+	Reason          string              `json:"reason"`
+	Message         string              `json:"message"`
+	Online          *bool               `json:"online"`
+	Conditions      []condition         `json:"conditions"`
 }
 
 type virtualClusterInstance struct {
@@ -181,8 +204,13 @@ type healthStatus struct {
 }
 
 type applicationStatus struct {
-	Health healthStatus    `json:"health"`
-	Sync   applicationSync `json:"sync"`
+	Health         healthStatus               `json:"health"`
+	Sync           applicationSync            `json:"sync"`
+	OperationState *applicationOperationState `json:"operationState,omitempty"`
+}
+
+type applicationOperationState struct {
+	Phase string `json:"phase"`
 }
 
 type applicationOperation struct {
@@ -987,18 +1015,46 @@ func loadWatcherConfig() (watcherConfig, error) {
 		bearerToken: token,
 	}
 
-	accessKeyCfg, err := loadWakeAccessKeyConfig()
+	wakeIdentity, err := loadWakeIdentity()
 	if err != nil {
 		return watcherConfig{}, err
 	}
-	if accessKeyCfg != nil {
+	if wakeIdentity != nil {
 		switch {
 		case wakeRequester == nil:
 			return watcherConfig{}, errors.New("WATCH_WAKE_ACCESS_KEY_USER/TEAM requires WATCH_WAKE_UPSTREAM_BASE")
 		case wakeRequester.bearerToken != "":
 			return watcherConfig{}, errors.New("set either WATCH_WAKE_ACCESS_KEY_USER/TEAM or WATCH_WAKE_BEARER_TOKEN/WATCH_WAKE_TOKEN_PATH, not both")
 		}
-		wakeRequester.accessKey = newWakeAccessKeyManager(api, *accessKeyCfg)
+		wakeTokenTTL, err := parsePositiveDuration("WATCH_WAKE_TOKEN_TTL", defaultWakeTokenTTL)
+		if err != nil {
+			return watcherConfig{}, err
+		}
+		if wakeTokenTTL < minWakeTokenTTL {
+			return watcherConfig{}, fmt.Errorf("WATCH_WAKE_TOKEN_TTL must be at least %s", minWakeTokenTTL)
+		}
+		wakeRequester.tokens = newWakeTokenIssuer(api, *wakeIdentity, wakeTokenTTL)
+	}
+
+	wakeDefault, err := parseWakeDefault(os.Getenv("WATCH_WAKE_DEFAULT"))
+	if err != nil {
+		return watcherConfig{}, err
+	}
+	sleepAfterSyncTimeout, err := parsePositiveDuration("WATCH_SLEEP_AFTER_SYNC_TIMEOUT", defaultSleepAfterSyncTimeout)
+	if err != nil {
+		return watcherConfig{}, err
+	}
+	sleepAfterSyncSettle, err := parsePositiveDuration("WATCH_SLEEP_AFTER_SYNC_SETTLE", defaultSleepAfterSyncSettle)
+	if err != nil {
+		return watcherConfig{}, err
+	}
+	wakeSubject := strings.TrimSpace(os.Getenv("WATCH_WAKE_SUBJECT"))
+	if wakeSubject == "" && wakeIdentity != nil {
+		wakeSubject = wakeIdentity.activitySubject()
+	}
+	annotationPrefix, err := parseAnnotationPrefix(os.Getenv("WATCH_ANNOTATION_PREFIX"))
+	if err != nil {
+		return watcherConfig{}, err
 	}
 
 	platformHost, err := normalizePlatformHost(os.Getenv("WATCH_PLATFORM_HOST"))
@@ -1034,6 +1090,11 @@ func loadWatcherConfig() (watcherConfig, error) {
 		argoCDAPI:                    argoCDAPI,
 		projectNamespacePrefixes:     projectNamespacePrefixes,
 		platformHost:                 platformHost,
+		wakeDefault:                  wakeDefault,
+		wakeSubject:                  wakeSubject,
+		sleepAfterSyncTimeout:        sleepAfterSyncTimeout,
+		sleepAfterSyncSettle:         sleepAfterSyncSettle,
+		annotationPrefix:             annotationPrefix,
 		updateVCILastActivityOnWake:  strings.EqualFold(mustEnv("WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE", "false"), "true"),
 		patchApplicationHealth:       !strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "true"), "false"),
 		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
@@ -1042,25 +1103,35 @@ func loadWatcherConfig() (watcherConfig, error) {
 	}, nil
 }
 
-func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster string) error {
+func (w *wakeRequester) Execute(ctx context.Context, project, namespace, virtualCluster string) error {
 	if w == nil {
 		return nil
 	}
 
+	// Any request through the Platform proxy wakes a sleeping tenant cluster.
+	// Platform then holds it until the cluster is ready and forwards it, so
+	// /version is used: every authenticated user may read it, so the wake
+	// user needs no permissions inside the tenant cluster.
 	targetURL := strings.TrimRight(w.baseURL, "/") +
 		"/kubernetes/project/" + url.PathEscape(project) +
-		"/virtualcluster/" + url.PathEscape(virtualCluster)
+		"/virtualcluster/" + url.PathEscape(virtualCluster) + "/version"
 
-	resp, err := w.post(ctx, targetURL, false)
+	resp, err := w.post(ctx, targetURL, namespace, virtualCluster, false)
 	if err != nil {
+		if isClientTimeout(err) {
+			// Platform signals the wake when the request arrives, then holds it
+			// for up to three minutes while the cluster starts.
+			log.Printf("wake request for %s/%s timed out while the tenant cluster was starting; the wake was already triggered", project, virtualCluster)
+			return nil
+		}
 		return err
 	}
-	// A managed key that was deleted or disabled answers 401. Repair it once
-	// and retry with the refreshed key.
-	if resp.StatusCode == http.StatusUnauthorized && w.accessKey != nil {
+	// A cached token that expired early or was deleted answers 401. Get a
+	// fresh one once and retry.
+	if resp.StatusCode == http.StatusUnauthorized && w.tokens != nil {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
-		if resp, err = w.post(ctx, targetURL, true); err != nil {
+		if resp, err = w.post(ctx, targetURL, namespace, virtualCluster, true); err != nil {
 			return err
 		}
 	}
@@ -1076,19 +1147,26 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	return fmt.Errorf("post wake request %s: %s: %s", targetURL, resp.Status, strings.TrimSpace(string(body)))
+	return fmt.Errorf("send wake request %s: %s: %s", targetURL, resp.Status, strings.TrimSpace(string(body)))
 }
 
-func (w *wakeRequester) post(ctx context.Context, targetURL string, refreshToken bool) (*http.Response, error) {
+// isClientTimeout reports whether err is the wake client's own timeout, as
+// opposed to a refused connection or an HTTP error status.
+func isClientTimeout(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func (w *wakeRequester) post(ctx context.Context, targetURL, namespace, virtualCluster string, refreshToken bool) (*http.Response, error) {
 	token := w.bearerToken
-	if w.accessKey != nil {
+	if w.tokens != nil {
 		var err error
-		if token, err = w.accessKey.token(ctx, refreshToken); err != nil {
-			return nil, fmt.Errorf("wake access key: %w", err)
+		if token, err = w.tokens.token(ctx, namespace, virtualCluster, refreshToken); err != nil {
+			return nil, err
 		}
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("build wake request: %w", err)
 	}
@@ -1099,7 +1177,7 @@ func (w *wakeRequester) post(ctx context.Context, targetURL string, refreshToken
 
 	resp, err := w.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("post wake request %s: %w", targetURL, err)
+		return nil, fmt.Errorf("send wake request %s: %w", targetURL, err)
 	}
 	return resp, nil
 }
@@ -1115,6 +1193,9 @@ func newWatcherRuntime() *watcherRuntime {
 		lastKnownKargoHealth:    map[string]healthStatus{},
 		prefixMatchLogged:       map[string]bool{},
 		ambiguousMatchLogged:    map[string]bool{},
+		wakeSuppressedLogged:    map[string]bool{},
+		sleepAfterSync:          map[string]*sleepAfterSyncState{},
+		invalidWakeLogged:       map[string]bool{},
 		pauseDisabledLogged:     map[string]bool{},
 	}
 }
@@ -1150,6 +1231,10 @@ func listPromotionsOptional(ctx context.Context, cfg *watcherConfig, runtime *wa
 }
 
 func (a *kubernetesAPI) request(ctx context.Context, method, path string, query url.Values, contentType string, body []byte) ([]byte, error) {
+	return a.requestWithHeaders(ctx, method, path, query, contentType, body, nil)
+}
+
+func (a *kubernetesAPI) requestWithHeaders(ctx context.Context, method, path string, query url.Values, contentType string, body []byte, headers http.Header) ([]byte, error) {
 	targetURL := strings.TrimRight(a.apiBase, "/") + path
 	if len(query) > 0 {
 		targetURL += "?" + query.Encode()
@@ -1170,6 +1255,11 @@ func (a *kubernetesAPI) request(ctx context.Context, method, path string, query 
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	for name, values := range headers {
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
 	}
 
 	resp, err := a.client.Do(req)
@@ -1639,6 +1729,39 @@ func expandClusterSecretNames(templates []string, project, name string) []string
 		}
 	}
 	return expanded
+}
+
+// parseAnnotationPrefix reads WATCH_ANNOTATION_PREFIX, which must be a DNS
+// subdomain the operator controls, per Kubernetes annotation key rules.
+func parseAnnotationPrefix(raw string) (string, error) {
+	prefix := strings.TrimSuffix(strings.TrimSpace(raw), "/")
+	if prefix == "" {
+		return defaultAnnotationPrefix, nil
+	}
+	invalid := fmt.Errorf("WATCH_ANNOTATION_PREFIX %q is not a valid DNS subdomain", raw)
+	if len(prefix) > 253 {
+		return "", invalid
+	}
+	for _, label := range strings.Split(prefix, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", invalid
+		}
+		for _, r := range label {
+			if (r < 'a' || r > 'z') && (r < '0' || r > '9') && r != '-' {
+				return "", invalid
+			}
+		}
+	}
+	return prefix, nil
+}
+
+// wakeAnnotation is the full key of the per-VCI wake override.
+func (cfg *watcherConfig) wakeAnnotation() string {
+	prefix := cfg.annotationPrefix
+	if prefix == "" {
+		prefix = defaultAnnotationPrefix
+	}
+	return prefix + "/" + wakeAnnotationName
 }
 
 func removeString(values []string, drop string) []string {
@@ -2311,7 +2434,21 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 			log.Printf("marked cluster secret %s/%s with %s=true for sleeping VCI %s/%s", cfg.argocdClusterSecretNamespace, secretMetaName, argocdSkipReconcileAnnotation, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
-		if cfg.wakeRequester != nil {
+		if state := runtime.sleepAfterSync[runtimeKey]; state != nil && !state.readyAt.IsZero() {
+			// It went back to sleep after the deploy, by the watcher or its timer.
+			delete(runtime.sleepAfterSync, runtimeKey)
+		}
+		mode := wakeModeForVCI(cfg, runtime, vci)
+		wakeAllowed := mode != wakeModeOff
+		if cfg.wakeRequester != nil && !wakeAllowed {
+			if hasActiveWork && !runtime.wakeSuppressedLogged[runtimeKey] {
+				runtime.wakeSuppressedLogged[runtimeKey] = true
+				log.Printf("not waking sleeping VCI %s/%s despite pending GitOps work: wake is disabled for it (%s, WATCH_WAKE_DEFAULT)", vci.Metadata.Namespace, vci.Metadata.Name, cfg.wakeAnnotation())
+			}
+		} else {
+			delete(runtime.wakeSuppressedLogged, runtimeKey)
+		}
+		if cfg.wakeRequester != nil && wakeAllowed {
 			now := time.Now()
 			shouldWake := false
 			triggerApps := []application(nil)
@@ -2357,7 +2494,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 
 			if shouldWake {
-				if err := cfg.wakeRequester.Execute(ctx, project, vci.Metadata.Name); err != nil {
+				if err := cfg.wakeRequester.Execute(ctx, project, vci.Metadata.Namespace, vci.Metadata.Name); err != nil {
 					return fmt.Errorf(
 						"wake sleeping VCI %s/%s from %s: %w",
 						vci.Metadata.Namespace,
@@ -2369,6 +2506,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 				touchVCILastActivityOnWake(ctx, cfg, vci, now)
 				runtime.lastWakeAttempt[runtimeKey] = now
+				trackSleepAfterSync(runtime, runtimeKey, mode, now)
 				rememberSyncIntentApplications(runtime, syncIntentApps)
 				rememberRefreshRequestApplications(runtime, refreshRequestApps)
 				rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -2449,6 +2587,9 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			log.Printf("re-paused idle ready cluster secret %s/%s for VCI %s/%s", cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
 		}
 		delete(runtime.lastWakeAttempt, runtimeKey)
+		if err := sleepAfterSyncIfDone(ctx, cfg, runtime, vci, runtimeKey, apps, hasActiveWork); err != nil {
+			return err
+		}
 	case vciStateUnknown:
 		delete(runtime.observedReadyRefreshes, runtimeKey)
 		if pauseEnabled && !secretPaused && !hasActiveWork {
@@ -2564,12 +2705,8 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 func run(ctx context.Context, cfg *watcherConfig) error {
 	runtime := newWatcherRuntime()
 
-	// Create the managed wake key up front so a misconfiguration shows at
-	// startup. Failures are retried on the first wake request.
-	if cfg.wakeRequester != nil && cfg.wakeRequester.accessKey != nil {
-		if _, err := cfg.wakeRequester.accessKey.token(ctx, false); err != nil {
-			log.Printf("ensure wake access key failed; retrying on the first wake request: %v", err)
-		}
+	if cfg.wakeRequester != nil && cfg.wakeRequester.tokens != nil {
+		log.Printf("wake requests use short-lived per-VCI tokens issued for %s (TTL %s)", cfg.wakeRequester.tokens.identity, cfg.wakeRequester.tokens.ttl)
 	}
 
 	if err := reconcileAll(ctx, cfg, runtime); err != nil {
@@ -2606,7 +2743,7 @@ func describeWakeSources(cfg watcherConfig) string {
 		sources = append(sources, "vci-lastActivity-status-touch-on-wake")
 	}
 
-	return strings.Join(sources, ",")
+	return strings.Join(sources, ",") + " (" + describeWakeMode(cfg) + ")"
 }
 
 func main() {

@@ -142,11 +142,24 @@ func cloneForwardHeaders(src http.Header) http.Header {
 	return dst
 }
 
+// parseWakeRequest recognizes the two wake request shapes: a POST under the
+// tenant cluster path, and GET <base>/version, which vcluster-gitops-watcher
+// sends because any authenticated user may read /version once the woken
+// cluster forwards the request.
 func parseWakeRequest(r *http.Request) (wakeRequestInfo, bool) {
-	if r.Method != http.MethodPost {
+	info, ok := parseWakePath(r.URL.Path)
+	if !ok {
 		return wakeRequestInfo{}, false
 	}
-	return parseWakePath(r.URL.Path)
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	switch {
+	case r.Method == http.MethodPost:
+		return info, true
+	case r.Method == http.MethodGet && len(parts) == 6 && parts[5] == "version":
+		return info, true
+	default:
+		return wakeRequestInfo{}, false
+	}
 }
 
 func parseWakePath(path string) (wakeRequestInfo, bool) {

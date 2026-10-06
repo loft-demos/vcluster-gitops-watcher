@@ -1,0 +1,27 @@
+# The only permissions vcluster-gitops-watcher needs to wake a sleeping tenant
+# cluster:
+#   - use on virtualclusterinstances: checked by the vCluster Platform proxy
+#     before it wakes or forwards to a tenant cluster.
+#   - create on virtualclusterinstances/kubeconfig: only for short-lived wake
+#     tokens (WATCH_WAKE_ACCESS_KEY_USER), which are requested as this user.
+# No get or list on VCIs and no permissions inside tenant clusters.
+apiVersion: management.loft.sh/v1
+kind: ClusterRoleTemplate
+metadata:
+  name: gitops-watcher-wake
+  labels:
+    # Also lists the role as a project role in the Platform UI, for
+    # project-member.yaml.
+    loft.sh/project-role: "true"
+spec:
+  displayName: GitOps Watcher Wake
+  description: Wakes sleeping tenant clusters for vcluster-gitops-watcher. No access inside tenant clusters.
+  management: true
+  clusterRoleTemplate:
+    rules:
+      - apiGroups: ["management.loft.sh"]
+        resources: ["virtualclusterinstances"]
+        verbs: ["use"]
+      - apiGroups: ["management.loft.sh"]
+        resources: ["virtualclusterinstances/kubeconfig"]
+        verbs: ["create"]

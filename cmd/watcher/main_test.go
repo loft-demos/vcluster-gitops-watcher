@@ -815,10 +815,10 @@ func TestReconcileVCITriggersWakeOncePerObservedSyncIntent(t *testing.T) {
 
 	wakeCalls := 0
 	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST wake request, got %s", r.Method)
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET wake request, got %s", r.Method)
 		}
-		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a" {
+		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a/version" {
 			t.Fatalf("unexpected wake path %q", r.URL.Path)
 		}
 		wakeCalls++
@@ -897,10 +897,10 @@ func TestReconcileVCITriggersWakeOnNewRefreshRequest(t *testing.T) {
 
 	wakeCalls := 0
 	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST wake request, got %s", r.Method)
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET wake request, got %s", r.Method)
 		}
-		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a" {
+		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a/version" {
 			t.Fatalf("unexpected wake path %q", r.URL.Path)
 		}
 		wakeCalls++
@@ -1463,10 +1463,10 @@ func TestReconcileVCITriggersWakeForNewOutOfSyncRevision(t *testing.T) {
 
 	wakeCalls := 0
 	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			t.Fatalf("expected POST wake request, got %s", r.Method)
+		if r.Method != http.MethodGet {
+			t.Fatalf("expected GET wake request, got %s", r.Method)
 		}
-		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a" {
+		if r.URL.Path != "/kubernetes/project/demo/virtualcluster/team-a/version" {
 			t.Fatalf("unexpected wake path %q", r.URL.Path)
 		}
 		wakeCalls++
@@ -2519,5 +2519,130 @@ func TestLoadWatcherConfigReadsPlatformHost(t *testing.T) {
 	}
 	if cfg.platformHost != "https://platform.example.com" {
 		t.Fatalf("expected normalized platform host, got %q", cfg.platformHost)
+	}
+}
+
+// wakeCallsForSleepingVCIWithSyncIntent reconciles one sleeping, already paused
+// VCI that has a pending Argo CD sync and returns how many wake requests the
+// watcher sent.
+func wakeCallsForSleepingVCIWithSyncIntent(t *testing.T, wakeDefault wakeMode, vciAnnotations map[string]string) int {
+	t.Helper()
+	const secretName = "loft-demo-vcluster-team-a"
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := watcherConfig{
+		api: &kubernetesAPI{client: apiServer.Client(), apiBase: apiServer.URL, bearerToken: "token"},
+		wakeRequester: &wakeRequester{
+			client:           wakeServer.Client(),
+			baseURL:          wakeServer.URL,
+			acceptedStatuses: parseStatusSet("502,504"),
+		},
+		wakeRetryInterval:            time.Hour,
+		wakeDefault:                  wakeDefault,
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+	annotations := map[string]string{sleepingSinceAnnotation: "1711800000"}
+	for k, v := range vciAnnotations {
+		annotations[k] = v
+	}
+	vci := virtualClusterInstance{Metadata: metadata{Name: "team-a", Namespace: "p-demo", Annotations: annotations}}
+	appsByDestination := map[string][]application{
+		secretName: {{
+			Metadata:  metadata{Name: "guestbook"},
+			Operation: &applicationOperation{Sync: json.RawMessage(`{"revision":"abc123"}`)},
+		}},
+	}
+	idx := reconcileIndexForTest(appsByDestination, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	return wakeCalls
+}
+
+func TestReconcileVCIWakeDefaultAndAnnotation(t *testing.T) {
+	wakeKey := defaultAnnotationPrefix + "/" + wakeAnnotationName
+	tests := []struct {
+		name        string
+		wakeDefault wakeMode
+		annotations map[string]string
+		wantWakes   int
+	}{
+		{name: "default enabled, no annotation", wantWakes: 1},
+		{name: "default enabled, opted out", annotations: map[string]string{wakeKey: "false"}, wantWakes: 0},
+		{name: "default disabled, no annotation", wakeDefault: wakeModeOff, wantWakes: 0},
+		{name: "default disabled, opted in", wakeDefault: wakeModeOff, annotations: map[string]string{wakeKey: "true"}, wantWakes: 1},
+		{name: "default disabled, opted in to sync", wakeDefault: wakeModeOff, annotations: map[string]string{wakeKey: "sync"}, wantWakes: 1},
+		{name: "default sync, no annotation", wakeDefault: wakeModeSync, wantWakes: 1},
+		{name: "default sync, opted out", wakeDefault: wakeModeSync, annotations: map[string]string{wakeKey: "false"}, wantWakes: 0},
+		{name: "default disabled, invalid value falls back", wakeDefault: wakeModeOff, annotations: map[string]string{wakeKey: "yes"}, wantWakes: 0},
+		{name: "default enabled, other prefix ignored", annotations: map[string]string{"example.com/wake": "false"}, wantWakes: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := wakeCallsForSleepingVCIWithSyncIntent(t, test.wakeDefault, test.annotations); got != test.wantWakes {
+				t.Fatalf("got %d wake calls, want %d", got, test.wantWakes)
+			}
+		})
+	}
+}
+
+func TestParseWakeDefault(t *testing.T) {
+	for raw, want := range map[string]wakeMode{"": wakeModeOn, "enabled": wakeModeOn, "TRUE": wakeModeOn, "disabled": wakeModeOff, "false": wakeModeOff, "Sync": wakeModeSync} {
+		got, err := parseWakeDefault(raw)
+		if err != nil || got != want {
+			t.Fatalf("parseWakeDefault(%q) = %v, %v; want %v", raw, got, err, want)
+		}
+	}
+	if _, err := parseWakeDefault("sometimes"); err == nil {
+		t.Fatalf("expected an error for an invalid value")
+	}
+}
+
+func TestParseAnnotationPrefix(t *testing.T) {
+	valid := map[string]string{
+		"":                     defaultAnnotationPrefix,
+		"watcher.example.com/": "watcher.example.com",
+		"example.com":          "example.com",
+	}
+	for raw, want := range valid {
+		got, err := parseAnnotationPrefix(raw)
+		if err != nil || got != want {
+			t.Fatalf("parseAnnotationPrefix(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, raw := range []string{"Example.com", "-bad.com", "a..b", "has space.com", "under_score.com"} {
+		if _, err := parseAnnotationPrefix(raw); err == nil {
+			t.Fatalf("expected parseAnnotationPrefix(%q) to fail", raw)
+		}
+	}
+}
+
+func TestLoadWatcherConfigReadsWakeDefaultAndPrefix(t *testing.T) {
+	t.Setenv("WATCH_KUBERNETES_API", "http://127.0.0.1")
+	t.Setenv("WATCH_TOKEN_PATH", writeWatcherTestToken(t))
+	t.Setenv("WATCH_WAKE_DEFAULT", "disabled")
+	t.Setenv("WATCH_ANNOTATION_PREFIX", "watcher.example.com")
+
+	cfg, err := loadWatcherConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.wakeDefault != wakeModeOff || cfg.wakeAnnotation() != "watcher.example.com/wake" {
+		t.Fatalf("unexpected config: default=%q annotation=%q", cfg.wakeDefault, cfg.wakeAnnotation())
 	}
 }

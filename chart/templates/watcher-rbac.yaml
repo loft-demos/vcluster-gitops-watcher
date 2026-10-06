@@ -14,6 +14,14 @@ rules:
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
     verbs: ["get", "list", "watch"]
+  {{- if or .Values.watcher.wake.upstreamBase (and .Values.watcher.wake.useProxy .Values.proxy.enabled) }}
+  # Sleep after sync sets sleepmode.loft.sh/force on a VCI once its deploy is
+  # done. Any VCI can opt in with the wake annotation, so this is not limited
+  # to wake.default=sync.
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances"]
+    verbs: ["patch"]
+  {{- end }}
   {{- if .Values.watcher.wake.updateVCILastActivity }}
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances/status"]
@@ -21,23 +29,30 @@ rules:
   {{- end }}
   {{- $accessKey := .Values.watcher.wake.accessKey }}
   {{- if and (or .Values.watcher.wake.upstreamBase (and .Values.watcher.wake.useProxy .Values.proxy.enabled)) (or $accessKey.user $accessKey.team) }}
-  # Managed wake AccessKey. Kubernetes RBAC cannot limit create by name.
-  - apiGroups: ["storage.loft.sh"]
-    resources: ["accesskeys"]
+  # Short-lived wake tokens: request a token kubeconfig for a VCI while
+  # impersonating only the configured Platform user or team.
+  {{- $impersonateUser := ternary $accessKey.user (printf "loft:team:%s" $accessKey.team) (not (empty $accessKey.user)) }}
+  {{- $impersonateGroup := ternary (printf "loft:user:%s" $accessKey.user) (printf "loft:team:%s" $accessKey.team) (not (empty $accessKey.user)) }}
+  - apiGroups: [""]
+    resources: ["users"]
+    resourceNames: [{{ $impersonateUser | quote }}]
+    verbs: ["impersonate"]
+  - apiGroups: [""]
+    resources: ["groups"]
+    resourceNames: [{{ $impersonateGroup | quote }}]
+    verbs: ["impersonate"]
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances/kubeconfig"]
     verbs: ["create"]
-  - apiGroups: ["storage.loft.sh"]
-    resources: ["accesskeys"]
-    resourceNames: [{{ $accessKey.name | quote }}]
-    verbs: ["get", "patch"]
-  - apiGroups: ["storage.loft.sh"]
-    resources: [{{ ternary "users" "teams" (not (empty $accessKey.user)) | quote }}]
-    resourceNames: [{{ default $accessKey.team $accessKey.user | quote }}]
-    verbs: ["get"]
   {{- end }}
   {{- if .Values.watcher.kargo.enabled }}
   - apiGroups: ["kargo.akuity.io"]
     resources: ["promotions"]
     verbs: ["get", "list", "watch"]
+  # Sleep after sync waits for the Stage to be Ready (verified) first.
+  - apiGroups: ["kargo.akuity.io"]
+    resources: ["stages"]
+    verbs: ["get"]
   {{- end }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

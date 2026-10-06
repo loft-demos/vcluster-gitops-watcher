@@ -422,3 +422,29 @@ func TestArgoClusterSecretRefreshActionPatchesExpectedSecret(t *testing.T) {
 		t.Fatalf("expected RFC3339 timestamp, got %q (%v)", rawTimestamp, err)
 	}
 }
+
+func TestParseWakeRequestAcceptsWatcherVersionProbe(t *testing.T) {
+	tests := []struct {
+		method string
+		path   string
+		want   bool
+	}{
+		{http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a", true},
+		{http.MethodPost, "/kubernetes/project/demo/virtualcluster/team-a/api/v1/namespaces", true},
+		{http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a/version", true},
+		{http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a", false},
+		{http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a/api/v1/pods", false},
+		{http.MethodGet, "/kubernetes/project/demo/virtualcluster/team-a/version/extra", false},
+		{http.MethodGet, "/api/v1/version", false},
+	}
+	for _, test := range tests {
+		req := httptest.NewRequest(test.method, test.path, nil)
+		info, ok := parseWakeRequest(req)
+		if ok != test.want {
+			t.Fatalf("%s %s: got %v, want %v", test.method, test.path, ok, test.want)
+		}
+		if ok && (info.Project != "demo" || info.VirtualCluster != "team-a") {
+			t.Fatalf("%s %s: unexpected info %+v", test.method, test.path, info)
+		}
+	}
+}

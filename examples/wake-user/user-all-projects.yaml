@@ -1,0 +1,17 @@
+# Wake user with the gitops-watcher-wake role in every project, including
+# projects created later. No per-project setup.
+#
+# No password, so nobody can log in as this user, and no team memberships, so
+# it only gets the role below.
+apiVersion: management.loft.sh/v1
+kind: User
+metadata:
+  name: gitops-watcher
+spec:
+  username: gitops-watcher
+  subject: gitops-watcher
+  displayName: GitOps Watcher
+  description: Identity of vcluster-gitops-watcher for waking sleeping tenant clusters.
+  # Bound cluster-wide, so it applies in every project namespace.
+  clusterRoles:
+    - name: gitops-watcher-wake

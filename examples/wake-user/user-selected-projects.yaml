@@ -1,0 +1,12 @@
+# Wake user without any role of its own. Use this instead of
+# user-all-projects.yaml when the wake identity must only reach some projects,
+# then add it to each of them as shown in project-member.yaml.
+apiVersion: management.loft.sh/v1
+kind: User
+metadata:
+  name: gitops-watcher
+spec:
+  username: gitops-watcher
+  subject: gitops-watcher
+  displayName: GitOps Watcher
+  description: Identity of vcluster-gitops-watcher for waking sleeping tenant clusters in selected projects.
