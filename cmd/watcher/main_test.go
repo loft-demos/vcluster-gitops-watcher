@@ -2313,3 +2313,211 @@ func TestLoadWatcherConfigPluralTemplatesSupersedeSingular(t *testing.T) {
 		t.Fatalf("expected plural templates to win, got %v", cfg.clusterSecretNameTemplates)
 	}
 }
+
+// labeledClusterSecret builds a cluster Secret carrying the platform's VCI
+// labels, as both the legacy and v2 integrations write it.
+func labeledClusterSecret(metaName, dataName, server, vciNamespace, vciName string) secret {
+	s := v2ClusterSecret(metaName, dataName, server)
+	s.Metadata.Labels = map[string]string{
+		vciNamespaceLabel: vciNamespace,
+		vciNameLabel:      vciName,
+	}
+	return s
+}
+
+func TestClusterSecretIndexResolvesByVCILabels(t *testing.T) {
+	index := buildClusterSecretIndex([]secret{
+		labeledClusterSecret("cluster-a", "loft-demo-virtualcluster-team-a-argocd-1a2b3c", "https://platform.example.com/kubernetes/project/demo/virtualcluster/team-a", "p-demo", "team-a"),
+		labeledClusterSecret("cluster-b", "loft-demo-virtualcluster-team-b-argocd-1a2b3c", "https://platform.example.com/kubernetes/project/demo/virtualcluster/team-b", "p-demo", "team-b"),
+	})
+
+	resolved := index.resolveQuery(clusterSecretQuery{
+		expectedNames: expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), "demo", "team-a"),
+		instanceKey:   instanceKey("p-demo", "team-a"),
+	})
+	if resolved.secretMetadataName() != "cluster-a" {
+		t.Fatalf("expected label match on cluster-a, got %+v", resolved)
+	}
+	if resolved.matchedViaPrefix {
+		t.Fatalf("label match must not be reported as a fallback match")
+	}
+}
+
+func TestClusterSecretIndexRefusesAmbiguousLabelsWithoutPlatformHost(t *testing.T) {
+	index := buildClusterSecretIndex([]secret{
+		labeledClusterSecret("cluster-ours", "loft-demo-virtualcluster-team-a-argocd-1a2b3c", "https://ours.example.com/kubernetes/project/demo/virtualcluster/team-a", "p-demo", "team-a"),
+		labeledClusterSecret("cluster-theirs", "loft-demo-virtualcluster-team-a-argocd-9f8e7d", "https://theirs.example.com/kubernetes/project/demo/virtualcluster/team-a", "p-demo", "team-a"),
+	})
+	query := clusterSecretQuery{
+		expectedNames: expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), "demo", "team-a"),
+		instanceKey:   instanceKey("p-demo", "team-a"),
+	}
+
+	resolved := index.resolveQuery(query)
+	if resolved.secret != nil {
+		t.Fatalf("expected no match when two platforms share Argo CD, got %q", resolved.secretMetadataName())
+	}
+	if len(resolved.ambiguous) == 0 {
+		t.Fatalf("expected the ambiguous candidates to be reported")
+	}
+
+	query.platformHost = "https://ours.example.com"
+	resolved = index.resolveQuery(query)
+	if resolved.secretMetadataName() != "cluster-ours" {
+		t.Fatalf("expected the platform host to select cluster-ours, got %+v", resolved)
+	}
+}
+
+func TestClusterSecretIndexResolvesInstanceIDHashSuffix(t *testing.T) {
+	// Unlabeled, as seen through Argo CD API discovery or older registrations.
+	index := buildClusterSecretIndex([]secret{
+		v2ClusterSecret("cluster-a", "loft-default-virtualcluster-llm-argocd-0c4f2e", "https://x"),
+		v2ClusterSecret("cluster-b", "loft-default-virtualcluster-llm-large-argocd-0c4f2e", "https://y"),
+	})
+
+	resolved := index.resolve(expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), "default", "llm"), nil)
+	if resolved.secretMetadataName() != "cluster-a" || !resolved.matchedViaPrefix {
+		t.Fatalf("expected hash-suffix fallback match on cluster-a, got %+v", resolved)
+	}
+}
+
+func TestClusterSecretIndexHashSuffixIgnoresLegacyNames(t *testing.T) {
+	// A legacy VCI named "team-1a2b3c" must never resolve for a VCI named "team".
+	index := buildClusterSecretIndex([]secret{
+		v2ClusterSecret("loft-demo-vcluster-team-1a2b3c", "loft-demo-vcluster-team-1a2b3c", ""),
+	})
+
+	resolved := index.resolve(expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), "demo", "team"), nil)
+	if resolved.secret != nil {
+		t.Fatalf("expected no match, got %q", resolved.secretMetadataName())
+	}
+}
+
+func TestClusterSecretIndexRefusesAmbiguousHashSuffix(t *testing.T) {
+	index := buildClusterSecretIndex([]secret{
+		v2ClusterSecret("cluster-ours", "loft-default-virtualcluster-llm-argocd-0c4f2e", "https://ours.example.com/kubernetes/project/default/virtualcluster/llm"),
+		v2ClusterSecret("cluster-theirs", "loft-default-virtualcluster-llm-argocd-77aa01", "https://theirs.example.com/kubernetes/project/default/virtualcluster/llm"),
+	})
+	query := clusterSecretQuery{expectedNames: expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), "default", "llm")}
+
+	if resolved := index.resolveQuery(query); resolved.secret != nil {
+		t.Fatalf("expected no match for two hashed candidates, got %q", resolved.secretMetadataName())
+	}
+
+	query.platformHost = "https://theirs.example.com"
+	if resolved := index.resolveQuery(query); resolved.secretMetadataName() != "cluster-theirs" {
+		t.Fatalf("expected the platform host to select cluster-theirs, got %+v", resolved)
+	}
+}
+
+func TestClusterSecretIndexTruncatedPrefixHonorsPlatformHost(t *testing.T) {
+	longProject := strings.Repeat("p", 40)
+	expected := expandClusterSecretNames(parseList(defaultClusterSecretNameTemplates), longProject, "team-a")
+	truncated := expected[0][:clusterNamePrefixMatchLength] + "-9f2a1"
+	index := buildClusterSecretIndex([]secret{v2ClusterSecret("cluster-other", truncated, "https://other.example.com/x")})
+
+	resolved := index.resolveQuery(clusterSecretQuery{expectedNames: expected, platformHost: "https://ours.example.com"})
+	if resolved.secret != nil {
+		t.Fatalf("expected a prefix match on another platform's host to be rejected, got %q", resolved.secretMetadataName())
+	}
+}
+
+func TestNormalizePlatformHost(t *testing.T) {
+	tests := map[string]string{
+		"":                                  "",
+		"platform.example.com":              "https://platform.example.com",
+		"HTTPS://Platform.Example.com/":     "https://platform.example.com",
+		"https://platform.example.com:8443": "https://platform.example.com:8443",
+	}
+	for in, want := range tests {
+		got, err := normalizePlatformHost(in)
+		if err != nil {
+			t.Fatalf("normalizePlatformHost(%q) returned error: %v", in, err)
+		}
+		if got != want {
+			t.Fatalf("normalizePlatformHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// reconcilePauseTest runs one reconcile of a sleeping VCI and returns the
+// metadata.names of the cluster Secrets the watcher paused.
+func reconcilePauseTest(t *testing.T, cfg watcherConfig, vci virtualClusterInstance, idx reconcileIndex) []string {
+	t.Helper()
+	var paused []string
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/secrets/") {
+			paused = append(paused, r.URL.Path[strings.LastIndex(r.URL.Path, "/")+1:])
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer apiServer.Close()
+
+	cfg.api = &kubernetesAPI{client: apiServer.Client(), apiBase: apiServer.URL, bearerToken: "token"}
+	cfg.argocdApplicationNamespace = "argocd"
+	cfg.argocdClusterSecretNamespace = "argocd"
+	cfg.clusterSecretNameTemplates = parseList(defaultClusterSecretNameTemplates)
+	cfg.projectNamespacePrefixes = []string{"p-", "loft-p-"}
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	return paused
+}
+
+func sleepingVCI(namespace, name string, annotations map[string]string) virtualClusterInstance {
+	merged := map[string]string{sleepingSinceAnnotation: "1711800000"}
+	for k, v := range annotations {
+		merged[k] = v
+	}
+	return virtualClusterInstance{Metadata: metadata{Name: name, Namespace: namespace, Annotations: merged}}
+}
+
+func TestReconcileVCIUsesRegisteredClusterNameAnnotation(t *testing.T) {
+	// A name no template or fallback rule predicts, so only the annotation
+	// can resolve it. Akuity v2 Applications target it by destination name.
+	const registered = "renamed-team-a-cluster"
+	app := application{
+		Metadata: metadata{Name: "guestbook"},
+		Spec:     applicationSpec{Destination: applicationDestination{Name: registered}},
+	}
+	idx := reconcileIndexForTest(
+		map[string][]application{registered: {app}},
+		[]secret{v2ClusterSecret("cluster-host-abc", registered, "")},
+		nil,
+	)
+
+	paused := reconcilePauseTest(t, watcherConfig{}, sleepingVCI("p-demo", "team-a", map[string]string{registeredClusterNameAnnotation: registered}), idx)
+	if len(paused) != 1 || paused[0] != "cluster-host-abc" {
+		t.Fatalf("expected cluster-host-abc to be paused, got %v", paused)
+	}
+}
+
+func TestReconcileVCIDerivesServerFromPlatformHost(t *testing.T) {
+	// No labels, no Applications, unpredictable name: only the derived server matches.
+	idx := reconcileIndexForTest(nil, []secret{
+		v2ClusterSecret("cluster-host-abc", "custom-name", "https://platform.example.com/kubernetes/project/demo/virtualcluster/team-a"),
+	}, nil)
+
+	paused := reconcilePauseTest(t, watcherConfig{platformHost: "https://platform.example.com"}, sleepingVCI("p-demo", "team-a", nil), idx)
+	if len(paused) != 1 || paused[0] != "cluster-host-abc" {
+		t.Fatalf("expected cluster-host-abc to be paused, got %v", paused)
+	}
+}
+
+func TestLoadWatcherConfigReadsPlatformHost(t *testing.T) {
+	tokenFile := writeWatcherTestToken(t)
+	t.Setenv("WATCH_KUBERNETES_API", "http://127.0.0.1")
+	t.Setenv("WATCH_TOKEN_PATH", tokenFile)
+	t.Setenv("WATCH_PLATFORM_HOST", "Platform.Example.com")
+
+	cfg, err := loadWatcherConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.platformHost != "https://platform.example.com" {
+		t.Fatalf("expected normalized platform host, got %q", cfg.platformHost)
+	}
+}

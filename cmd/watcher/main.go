@@ -27,7 +27,16 @@ const (
 	argocdSkipReconcileAnnotation  = "argocd.argoproj.io/skip-reconcile"
 	kargoAuthorizedStageAnnotation = "kargo.akuity.io/authorized-stage"
 
-	loftProjectLabel                  = "loft.sh/project"
+	loftProjectLabel = "loft.sh/project"
+	// registeredClusterNameAnnotation is written on the VirtualClusterInstance
+	// by vCluster Platform once it has registered the tenant cluster with Argo
+	// CD. It holds the exact Argo CD cluster name, including the instance-ID
+	// hash suffix, so it is the most reliable match key when present.
+	registeredClusterNameAnnotation = "loft.sh/argocd-registered-cluster-name"
+	// vciNameLabel and vciNamespaceLabel are set on the Argo CD cluster Secret
+	// by both the legacy (v1) and the v2 ("connector") integrations.
+	vciNameLabel                      = "loft.sh/vcluster-instance-name"
+	vciNamespaceLabel                 = "loft.sh/vcluster-instance-namespace"
 	sleepingSinceAnnotation           = "sleepmode.loft.sh/sleeping-since"
 	sleepTypeAnnotation               = "sleepmode.loft.sh/sleep-type"
 	readyConditionType                = "Ready"
@@ -49,6 +58,10 @@ const (
 	// falling back to prefix matching for names the platform truncated. It
 	// leaves room for the platform's trailing "-" + hash suffix.
 	clusterNamePrefixMatchLength = 40
+	// instanceIDHashLength is the length of the hex hash of the platform
+	// instance ID that licensed platforms append to v2 cluster names, for
+	// example loft-default-virtualcluster-llm-argocd-1a2b3c.
+	instanceIDHashLength = 6
 
 	// defaultClusterSecretNameTemplates lists both known platform naming
 	// conventions in priority order: the v2 ("connector") infix first, then the
@@ -85,12 +98,17 @@ type watcherConfig struct {
 	argocdClusterSecretNamespace string
 	clusterSecretNameTemplates   []string
 	projectNamespacePrefixes     []string
-	argoCDAPI                    *argoCDAPIClient
-	updateVCILastActivityOnWake  bool
-	patchApplicationHealth       bool
-	applicationHealthPatchMode   string
-	sleepingHealthMessage        string
-	wakingHealthMessage          string
+	// platformHost is the normalized vCluster Platform base URL
+	// (scheme://host). When set, it derives each tenant cluster's Argo CD
+	// server URL and restricts label and fallback matches to Secrets that
+	// point at this platform.
+	platformHost                string
+	argoCDAPI                   *argoCDAPIClient
+	updateVCILastActivityOnWake bool
+	patchApplicationHealth      bool
+	applicationHealthPatchMode  string
+	sleepingHealthMessage       string
+	wakingHealthMessage         string
 }
 
 const (
@@ -109,6 +127,9 @@ type wakeRequester struct {
 	baseURL          string
 	bearerToken      string
 	acceptedStatuses map[int]struct{}
+	// accessKey, when set, supplies the bearer token from a platform
+	// AccessKey the watcher manages itself, in place of bearerToken.
+	accessKey *wakeAccessKeyManager
 }
 
 type watcherRuntime struct {
@@ -120,6 +141,7 @@ type watcherRuntime struct {
 	lastWakeAttempt          map[string]time.Time
 	lastKnownKargoHealth     map[string]healthStatus
 	prefixMatchLogged        map[string]bool
+	ambiguousMatchLogged     map[string]bool
 	pauseDisabledLogged      map[string]bool
 	kargoPromotionsChecked   bool
 	kargoPromotionsAvailable bool
@@ -247,17 +269,26 @@ func decodeSecretDataValue(raw string) string {
 }
 
 // clusterSecretIndex indexes Argo CD cluster Secrets by their decoded
-// data.name and normalized data.server so a VirtualClusterInstance can be
-// resolved to its real Secret metadata.name regardless of how Argo CD named it.
+// data.name, normalized data.server, and the platform's VCI labels so a
+// VirtualClusterInstance can be resolved to its real Secret metadata.name
+// regardless of how Argo CD named it.
 type clusterSecretIndex struct {
 	bySecretDataName map[string]*secret
 	byServer         map[string]*secret
+	// byInstance groups Secrets by "<vci-namespace>/<vci-name>" from the
+	// loft.sh/vcluster-instance-* labels. More than one entry means several
+	// platforms registered a tenant cluster with the same project and name.
+	byInstance map[string][]*secret
+	// ordered holds every indexed entry sorted by data.name so fallback
+	// matching is deterministic.
+	ordered []*secret
 }
 
 func buildClusterSecretIndex(secrets []secret) *clusterSecretIndex {
 	index := &clusterSecretIndex{
 		bySecretDataName: make(map[string]*secret, len(secrets)),
 		byServer:         make(map[string]*secret, len(secrets)),
+		byInstance:       make(map[string][]*secret, len(secrets)),
 	}
 	for i := range secrets {
 		s := &secrets[i]
@@ -271,8 +302,29 @@ func buildClusterSecretIndex(secrets []secret) *clusterSecretIndex {
 				index.byServer[server] = s
 			}
 		}
+		if key := instanceKey(s.Metadata.Labels[vciNamespaceLabel], s.Metadata.Labels[vciNameLabel]); key != "" {
+			index.byInstance[key] = append(index.byInstance[key], s)
+		}
+		index.ordered = append(index.ordered, s)
 	}
+	index.sortOrdered()
 	return index
+}
+
+func (index *clusterSecretIndex) sortOrdered() {
+	sort.SliceStable(index.ordered, func(i, j int) bool {
+		return index.ordered[i].dataName() < index.ordered[j].dataName()
+	})
+}
+
+// instanceKey is the byInstance key for a VCI, or "" when either part is empty.
+func instanceKey(namespace, name string) string {
+	namespace = strings.TrimSpace(namespace)
+	name = strings.TrimSpace(name)
+	if namespace == "" || name == "" {
+		return ""
+	}
+	return namespace + "/" + name
 }
 
 // addDiscoveryCluster registers a name<->server mapping discovered through the
@@ -289,15 +341,22 @@ func (index *clusterSecretIndex) addDiscoveryCluster(name, server string) {
 			"server": base64.StdEncoding.EncodeToString([]byte(strings.TrimSpace(server))),
 		},
 	}
+	added := false
 	if trimmed := strings.TrimSpace(name); trimmed != "" {
 		if _, exists := index.bySecretDataName[trimmed]; !exists {
 			index.bySecretDataName[trimmed] = entry
+			added = true
 		}
 	}
 	if normalized := normalizeServerURL(server); normalized != "" {
 		if _, exists := index.byServer[normalized]; !exists {
 			index.byServer[normalized] = entry
+			added = true
 		}
+	}
+	if added {
+		index.ordered = append(index.ordered, entry)
+		index.sortOrdered()
 	}
 }
 
@@ -313,8 +372,12 @@ type resolvedClusterSecret struct {
 	expectedNames []string
 	// server is the normalized tenant cluster server URL when known.
 	server string
-	// matchedViaPrefix is true when only the truncation/prefix fallback matched.
+	// matchedViaPrefix is true when only the hash-suffix or truncated-prefix
+	// fallback matched.
 	matchedViaPrefix bool
+	// ambiguous lists the data.names of Secrets that matched a label or
+	// fallback rule together, which the resolver refuses to pick between.
+	ambiguous []string
 }
 
 // secretMetadataName returns the real Kubernetes metadata.name to patch, or the
@@ -326,69 +389,200 @@ func (r resolvedClusterSecret) secretMetadataName() string {
 	return strings.TrimSpace(r.secret.Metadata.Name)
 }
 
-// resolve maps a project/VCI to its Argo CD cluster Secret. It prefers an exact
-// data.name match against any expanded template, then falls back to matching by
-// the normalized server URL of Applications targeting this destination, and
-// finally to a logged prefix match for names truncated by the platform.
+// clusterSecretQuery describes one VirtualClusterInstance for resolve.
+type clusterSecretQuery struct {
+	// expectedNames are candidate cluster names in priority order.
+	expectedNames []string
+	// instanceKey is "<vci-namespace>/<vci-name>" for label matching.
+	instanceKey string
+	// candidateServers are server URLs to try in order: the server derived
+	// from the platform host first, then servers carried on Applications.
+	candidateServers []string
+	// platformHost, when set, restricts label and fallback matches to Secrets
+	// whose server points at this platform.
+	platformHost string
+}
+
+// resolve maps expected names and candidate servers to a cluster Secret. It is
+// kept for callers that have no VCI labels or platform host to offer.
 func (index *clusterSecretIndex) resolve(expectedNames []string, candidateServers []string) resolvedClusterSecret {
-	resolved := resolvedClusterSecret{expectedNames: expectedNames}
-	if len(expectedNames) > 0 {
-		resolved.clusterName = expectedNames[0]
+	return index.resolveQuery(clusterSecretQuery{expectedNames: expectedNames, candidateServers: candidateServers})
+}
+
+// resolveQuery maps a project/VCI to its Argo CD cluster Secret, in order:
+//  1. exact data.name (the platform's registered-name annotation comes first),
+//  2. the loft.sh/vcluster-instance-* labels when exactly one Secret has them,
+//  3. the derived or Application-carried server URL,
+//  4. a hash-suffix or truncated-prefix match on the expected names, accepted
+//     only when exactly one Secret matches.
+//
+// With a platform host, steps 2 and 4 only consider Secrets pointing at that
+// host, so two platforms sharing one Argo CD never resolve to each other.
+func (index *clusterSecretIndex) resolveQuery(q clusterSecretQuery) resolvedClusterSecret {
+	resolved := resolvedClusterSecret{expectedNames: q.expectedNames}
+	if len(q.expectedNames) > 0 {
+		resolved.clusterName = q.expectedNames[0]
 	}
 
 	if index == nil {
 		return resolved
 	}
 
-	// 1. exact data.name match (covers v1, Akuity v2, and plain Argo CD v2).
-	for _, name := range expectedNames {
-		if s, ok := index.bySecretDataName[name]; ok {
-			resolved.secret = s
+	matched := func(s *secret) resolvedClusterSecret {
+		resolved.secret = s
+		resolved.server = normalizeServerURL(s.dataServer())
+		if name := s.dataName(); name != "" {
 			resolved.clusterName = name
-			resolved.server = normalizeServerURL(s.dataServer())
-			return resolved
+		}
+		return resolved
+	}
+
+	// 1. exact data.name match (covers v1, Akuity v2, and plain Argo CD v2).
+	for _, name := range q.expectedNames {
+		if s, ok := index.bySecretDataName[name]; ok {
+			return matched(s)
 		}
 	}
 
-	// 2. match by the server URL carried on Applications for this destination
-	//    (plain Argo CD v2 sets spec.destination.server, not name).
-	for _, server := range candidateServers {
+	// 2. platform VCI labels, set by both the legacy and v2 integrations.
+	if q.instanceKey != "" {
+		candidates := filterSecretsByHost(index.byInstance[q.instanceKey], q.platformHost)
+		switch len(candidates) {
+		case 1:
+			return matched(candidates[0])
+		case 0:
+		default:
+			resolved.ambiguous = secretDataNames(candidates)
+		}
+	}
+
+	// 3. match by server URL (plain Argo CD v2 sets spec.destination.server,
+	//    not name, and the platform host lets the watcher derive it directly).
+	for _, server := range q.candidateServers {
 		normalized := normalizeServerURL(server)
 		if normalized == "" {
 			continue
 		}
 		if s, ok := index.byServer[normalized]; ok {
-			resolved.secret = s
-			resolved.server = normalized
-			if name := s.dataName(); name != "" {
-				resolved.clusterName = name
-			}
-			return resolved
+			result := matched(s)
+			result.server = normalized
+			return result
 		}
 	}
 
-	// 3. prefix fallback for names truncated by the platform's
-	//    SafeConcatNameMax(..., clusterNameMaxLength) rule.
-	for _, name := range expectedNames {
-		if len(name) <= clusterNameMaxLength {
-			continue
-		}
-		prefix := name[:clusterNamePrefixMatchLength]
-		for dataName, s := range index.bySecretDataName {
-			if len(dataName) > clusterNameMaxLength {
-				continue
-			}
-			if strings.HasPrefix(dataName, prefix) {
-				resolved.secret = s
-				resolved.clusterName = dataName
-				resolved.server = normalizeServerURL(s.dataServer())
-				resolved.matchedViaPrefix = true
-				return resolved
+	// 4. fallback for names the platform extended with the instance-ID hash or
+	//    truncated with SafeConcatNameMax(..., clusterNameMaxLength).
+	var candidates []*secret
+	for _, s := range filterSecretsByHost(index.ordered, q.platformHost) {
+		dataName := s.dataName()
+		for _, name := range q.expectedNames {
+			if clusterNameFallbackMatch(name, dataName) {
+				candidates = append(candidates, s)
+				break
 			}
 		}
+	}
+	switch len(candidates) {
+	case 1:
+		result := matched(candidates[0])
+		result.matchedViaPrefix = true
+		return result
+	case 0:
+	default:
+		resolved.ambiguous = append(resolved.ambiguous, secretDataNames(candidates)...)
 	}
 
 	return resolved
+}
+
+// clusterNameFallbackMatch reports whether dataName is expected with the
+// platform's instance-ID hash appended, or is the truncated form of a name
+// that, with the hash, would exceed clusterNameMaxLength.
+func clusterNameFallbackMatch(expected, dataName string) bool {
+	if expected == "" || dataName == "" || len(dataName) > clusterNameMaxLength {
+		return false
+	}
+	if len(expected)+1+instanceIDHashLength <= clusterNameMaxLength {
+		// Only v2 names carry the hash, and they always end in "-argocd".
+		if !strings.HasSuffix(expected, argocdClusterNameSuffix) {
+			return false
+		}
+		suffix, ok := strings.CutPrefix(dataName, expected+"-")
+		return ok && isLowerHex(suffix, instanceIDHashLength)
+	}
+	return strings.HasPrefix(dataName, expected[:clusterNamePrefixMatchLength])
+}
+
+func isLowerHex(value string, length int) bool {
+	if len(value) != length {
+		return false
+	}
+	for _, r := range value {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// filterSecretsByHost keeps the Secrets whose server host equals the platform
+// host. An empty platform host keeps every Secret.
+func filterSecretsByHost(secrets []*secret, platformHost string) []*secret {
+	if platformHost == "" {
+		return secrets
+	}
+	want := serverHost(platformHost)
+	var out []*secret
+	for _, s := range secrets {
+		if serverHost(s.dataServer()) == want {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// serverHost returns the lower-cased host[:port] of a server URL.
+func serverHost(raw string) string {
+	parsed, err := url.Parse(normalizeServerURL(raw))
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(parsed.Host)
+}
+
+func secretDataNames(secrets []*secret) []string {
+	names := make([]string, 0, len(secrets))
+	for _, s := range secrets {
+		names = append(names, s.dataName())
+	}
+	return names
+}
+
+// normalizePlatformHost turns a host or base URL into scheme://host, adding
+// https:// when no scheme is given, the same way the platform builds its
+// Argo CD server URLs.
+func normalizePlatformHost(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if !strings.Contains(raw, "://") {
+		raw = "https://" + raw
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "", fmt.Errorf("invalid platform host %q", raw)
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host), nil
+}
+
+// platformServerURL returns the Argo CD server URL the platform registers for
+// a tenant cluster, or "" when no platform host is configured.
+func platformServerURL(platformHost, project, virtualCluster string) string {
+	if platformHost == "" || project == "" || virtualCluster == "" {
+		return ""
+	}
+	return platformHost + "/kubernetes/project/" + project + "/virtualcluster/" + virtualCluster
 }
 
 // normalizeServerURL trims a trailing slash and lower-cases the scheme and host
@@ -787,6 +981,31 @@ func loadWatcherConfig() (watcherConfig, error) {
 		return watcherConfig{}, err
 	}
 
+	api := &kubernetesAPI{
+		client:      client,
+		apiBase:     apiBase,
+		bearerToken: token,
+	}
+
+	accessKeyCfg, err := loadWakeAccessKeyConfig()
+	if err != nil {
+		return watcherConfig{}, err
+	}
+	if accessKeyCfg != nil {
+		switch {
+		case wakeRequester == nil:
+			return watcherConfig{}, errors.New("WATCH_WAKE_ACCESS_KEY_USER/TEAM requires WATCH_WAKE_UPSTREAM_BASE")
+		case wakeRequester.bearerToken != "":
+			return watcherConfig{}, errors.New("set either WATCH_WAKE_ACCESS_KEY_USER/TEAM or WATCH_WAKE_BEARER_TOKEN/WATCH_WAKE_TOKEN_PATH, not both")
+		}
+		wakeRequester.accessKey = newWakeAccessKeyManager(api, *accessKeyCfg)
+	}
+
+	platformHost, err := normalizePlatformHost(os.Getenv("WATCH_PLATFORM_HOST"))
+	if err != nil {
+		return watcherConfig{}, fmt.Errorf("parse WATCH_PLATFORM_HOST: %w", err)
+	}
+
 	wakeRetryInterval := defaultWakeRetryInterval
 	if raw := strings.TrimSpace(os.Getenv("WATCH_WAKE_RETRY_INTERVAL")); raw != "" {
 		parsed, err := time.ParseDuration(raw)
@@ -805,11 +1024,7 @@ func loadWatcherConfig() (watcherConfig, error) {
 	}
 
 	return watcherConfig{
-		api: &kubernetesAPI{
-			client:      client,
-			apiBase:     apiBase,
-			bearerToken: token,
-		},
+		api:                          api,
 		wakeRequester:                wakeRequester,
 		pollInterval:                 pollInterval,
 		wakeRetryInterval:            wakeRetryInterval,
@@ -818,6 +1033,7 @@ func loadWatcherConfig() (watcherConfig, error) {
 		clusterSecretNameTemplates:   clusterSecretNameTemplates,
 		argoCDAPI:                    argoCDAPI,
 		projectNamespacePrefixes:     projectNamespacePrefixes,
+		platformHost:                 platformHost,
 		updateVCILastActivityOnWake:  strings.EqualFold(mustEnv("WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE", "false"), "true"),
 		patchApplicationHealth:       !strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "true"), "false"),
 		applicationHealthPatchMode:   applicationHealthPatchModeStatus,
@@ -835,18 +1051,18 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 		"/kubernetes/project/" + url.PathEscape(project) +
 		"/virtualcluster/" + url.PathEscape(virtualCluster)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	resp, err := w.post(ctx, targetURL, false)
 	if err != nil {
-		return fmt.Errorf("build wake request: %w", err)
+		return err
 	}
-	req.Header.Set("Accept", "application/json")
-	if w.bearerToken != "" {
-		req.Header.Set("Authorization", "Bearer "+w.bearerToken)
-	}
-
-	resp, err := w.client.Do(req)
-	if err != nil {
-		return fmt.Errorf("post wake request %s: %w", targetURL, err)
+	// A managed key that was deleted or disabled answers 401. Repair it once
+	// and retry with the refreshed key.
+	if resp.StatusCode == http.StatusUnauthorized && w.accessKey != nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp, err = w.post(ctx, targetURL, true); err != nil {
+			return err
+		}
 	}
 	defer resp.Body.Close()
 
@@ -863,6 +1079,31 @@ func (w *wakeRequester) Execute(ctx context.Context, project, virtualCluster str
 	return fmt.Errorf("post wake request %s: %s: %s", targetURL, resp.Status, strings.TrimSpace(string(body)))
 }
 
+func (w *wakeRequester) post(ctx context.Context, targetURL string, refreshToken bool) (*http.Response, error) {
+	token := w.bearerToken
+	if w.accessKey != nil {
+		var err error
+		if token, err = w.accessKey.token(ctx, refreshToken); err != nil {
+			return nil, fmt.Errorf("wake access key: %w", err)
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build wake request: %w", err)
+	}
+	req.Header.Set("Accept", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("post wake request %s: %w", targetURL, err)
+	}
+	return resp, nil
+}
+
 func newWatcherRuntime() *watcherRuntime {
 	return &watcherRuntime{
 		observedSyncIntents:     map[string]string{},
@@ -873,6 +1114,7 @@ func newWatcherRuntime() *watcherRuntime {
 		lastWakeAttempt:         map[string]time.Time{},
 		lastKnownKargoHealth:    map[string]healthStatus{},
 		prefixMatchLogged:       map[string]bool{},
+		ambiguousMatchLogged:    map[string]bool{},
 		pauseDisabledLogged:     map[string]bool{},
 	}
 }
@@ -1397,6 +1639,16 @@ func expandClusterSecretNames(templates []string, project, name string) []string
 		}
 	}
 	return expanded
+}
+
+func removeString(values []string, drop string) []string {
+	out := make([]string, 0, len(values))
+	for _, v := range values {
+		if v != drop {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 func hasSleepAnnotation(annotations map[string]string) bool {
@@ -1968,6 +2220,11 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	}
 
 	expectedNames := expandClusterSecretNames(cfg.clusterSecretNameTemplates, project, vci.Metadata.Name)
+	// The platform records the exact registered name on the VCI, including the
+	// instance-ID hash suffix templates cannot predict, so it is tried first.
+	if registered := strings.TrimSpace(vci.Metadata.Annotations[registeredClusterNameAnnotation]); registered != "" {
+		expectedNames = append([]string{registered}, removeString(expectedNames, registered)...)
+	}
 
 	// Match Applications by every expected cluster name (v1 + Akuity v2).
 	var nameMatchedApps []application
@@ -1977,7 +2234,17 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 	// Resolve the cluster Secret from the index, preferring an exact data.name
 	// match and falling back to the server URLs carried on matched Applications.
-	resolved := idx.clusterSecrets.resolve(expectedNames, serversFromApplications(nameMatchedApps))
+	var candidateServers []string
+	if derived := platformServerURL(cfg.platformHost, project, vci.Metadata.Name); derived != "" {
+		candidateServers = append(candidateServers, derived)
+	}
+	candidateServers = append(candidateServers, serversFromApplications(nameMatchedApps)...)
+	resolved := idx.clusterSecrets.resolveQuery(clusterSecretQuery{
+		expectedNames:    expectedNames,
+		instanceKey:      instanceKey(vci.Metadata.Namespace, vci.Metadata.Name),
+		candidateServers: candidateServers,
+		platformHost:     cfg.platformHost,
+	})
 
 	// runtimeKey is the stable per-cluster key for runtime bookkeeping. For v1
 	// (single template) it equals the legacy templated Secret name, so observable
@@ -2004,7 +2271,11 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 	if resolved.matchedViaPrefix && runtime != nil && !runtime.prefixMatchLogged[runtimeKey] {
 		runtime.prefixMatchLogged[runtimeKey] = true
-		log.Printf("resolved cluster secret for VCI %s/%s via truncated-name prefix match (%s); prefer exact data.name", vci.Metadata.Namespace, vci.Metadata.Name, resolved.clusterName)
+		log.Printf("resolved cluster secret for VCI %s/%s via hash-suffix or truncated-name fallback match (%s); set %s or WATCH_PLATFORM_HOST for an exact match", vci.Metadata.Namespace, vci.Metadata.Name, resolved.clusterName, registeredClusterNameAnnotation)
+	}
+	if resolved.secret == nil && len(resolved.ambiguous) > 0 && runtime != nil && !runtime.ambiguousMatchLogged[runtimeKey] {
+		runtime.ambiguousMatchLogged[runtimeKey] = true
+		log.Printf("not pausing VCI %s/%s: several cluster Secrets match (%s), likely from platforms sharing this Argo CD; set WATCH_PLATFORM_HOST to pick this platform's Secret", vci.Metadata.Namespace, vci.Metadata.Name, strings.Join(resolved.ambiguous, ", "))
 	}
 	if apiOnly && runtime != nil && !runtime.pauseDisabledLogged[runtimeKey] {
 		runtime.pauseDisabledLogged[runtimeKey] = true
@@ -2292,6 +2563,14 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 
 func run(ctx context.Context, cfg *watcherConfig) error {
 	runtime := newWatcherRuntime()
+
+	// Create the managed wake key up front so a misconfiguration shows at
+	// startup. Failures are retried on the first wake request.
+	if cfg.wakeRequester != nil && cfg.wakeRequester.accessKey != nil {
+		if _, err := cfg.wakeRequester.accessKey.token(ctx, false); err != nil {
+			log.Printf("ensure wake access key failed; retrying on the first wake request: %v", err)
+		}
+	}
 
 	if err := reconcileAll(ctx, cfg, runtime); err != nil {
 		log.Printf("initial reconcile failed: %v", err)

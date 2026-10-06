@@ -3,6 +3,14 @@
 {{- fail "watcher.replicaCount must be 1 because the watcher does not implement leader election" }}
 {{- end }}
 {{- $wakeBase := include "vcluster-gitops-watcher.wakeUpstreamBase" . }}
+{{- $accessKey := .Values.watcher.wake.accessKey }}
+{{- $manageKey := and $wakeBase (or $accessKey.user $accessKey.team) }}
+{{- if and $accessKey.user $accessKey.team }}
+{{- fail "set only one of watcher.wake.accessKey.user or watcher.wake.accessKey.team" }}
+{{- end }}
+{{- if and $manageKey .Values.watcher.wake.existingSecret }}
+{{- fail "set either watcher.wake.existingSecret or watcher.wake.accessKey.user/team, not both" }}
+{{- end }}
 {{- $wakeToken := and $wakeBase .Values.watcher.wake.existingSecret }}
 {{- $argoAPI := .Values.argocd.api }}
 {{- if and $argoAPI.base (not $argoAPI.existingSecret) }}
@@ -64,6 +72,10 @@ spec:
             - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES
               value: {{ join "," . | quote }}
             {{- end }}
+            {{- with .Values.watcher.platformHost }}
+            - name: WATCH_PLATFORM_HOST
+              value: {{ . | quote }}
+            {{- end }}
             - name: WATCH_POLL_INTERVAL
               value: {{ .Values.watcher.pollInterval | quote }}
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
@@ -96,6 +108,20 @@ spec:
             {{- if $wakeToken }}
             - name: WATCH_WAKE_TOKEN_PATH
               value: /var/run/secrets/platform/token
+            {{- end }}
+            {{- if $manageKey }}
+            {{- with $accessKey.user }}
+            - name: WATCH_WAKE_ACCESS_KEY_USER
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $accessKey.team }}
+            - name: WATCH_WAKE_ACCESS_KEY_TEAM
+              value: {{ . | quote }}
+            {{- end }}
+            - name: WATCH_WAKE_ACCESS_KEY_NAME
+              value: {{ $accessKey.name | quote }}
+            - name: WATCH_WAKE_ACCESS_KEY_PROJECTS
+              value: {{ join "," $accessKey.projects | quote }}
             {{- end }}
             - name: WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE
               value: {{ .Values.watcher.wake.updateVCILastActivity | quote }}

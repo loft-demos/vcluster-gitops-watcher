@@ -1,5 +1,52 @@
 # Release Notes
 
+## 2.0.0-rc.1
+
+This release makes the watcher match vCluster Platform's v2 ("connector") Argo CD integration exactly, lets it create its own wake credentials, and ships it as a Helm chart. It targets vCluster Platform v4.12.0 and later, where Argo CD can no longer wake a sleeping tenant cluster and the watcher becomes the GitOps wake path.
+
+### Highlights
+
+- **Helm chart.** Install the watcher, and optionally the wakeup proxy, with `helm install vcluster-gitops-watcher oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher --version 2.0.0-rc.1`. The chart is published to GHCR on every GitHub release, with the chart version and image tags taken from the release tag.
+- **Reliable v2 cluster Secret matching.** Fixes v2 tenant clusters on licensed platforms never being paused.
+- **Managed wake access key.** The watcher can create and maintain its own vCluster Platform AccessKey for wake requests, so there is no token to create, store, or rotate by hand.
+
+### Cluster Secret Matching
+
+The watcher now resolves each `VirtualClusterInstance` to its Argo CD cluster Secret in this order:
+
+1. The exact name from the VCI annotation `loft.sh/argocd-registered-cluster-name`, which the platform writes after a successful v2 registration, then the configured name templates.
+2. The `loft.sh/vcluster-instance-name` and `loft.sh/vcluster-instance-namespace` labels, which both the legacy and v2 integrations set on the Secret.
+3. The server URL. The new `WATCH_PLATFORM_HOST` lets the watcher derive the exact server the platform registers (`https://<host>/kubernetes/project/<project>/virtualcluster/<name>`). Servers on matching Applications are tried next.
+4. A name fallback for the platform's instance-ID hash suffix and for names truncated to 49 characters.
+
+What this fixes:
+
+- On licensed platforms, v2 cluster names end with a 6-character hash of the platform instance ID (for example `loft-default-virtualcluster-llm-argocd-1a2b3c`). The name templates could not predict it, so the watcher never paused those tenant clusters unless a plain Argo CD Application already targeted them by server.
+- Akuity Applications, which target the hashed name by `destination.name`, now match too.
+- The name fallback was non-deterministic and accepted the first Secret it found. When several platforms share one Argo CD, it could pause another platform's Secret.
+
+### Managed Wake Access Key
+
+- Set `WATCH_WAKE_ACCESS_KEY_USER` (or `WATCH_WAKE_ACCESS_KEY_TEAM`) and the watcher creates a `storage.loft.sh/v1` AccessKey named `vcluster-gitops-watcher-wake` (`WATCH_WAKE_ACCESS_KEY_NAME`), scoped to `WATCH_WAKE_ACCESS_KEY_PROJECTS` (default `*`), and uses it for every wake request.
+- The key never carries `sleepmode.loft.sh/ignore-activity`. The watcher repairs or recreates it when it is deleted, disabled, or edited, on startup or after a wake request is rejected with `401`.
+- The watcher only manages an AccessKey it created, and refuses to take over an existing one with the same name.
+- In the chart: `watcher.wake.accessKey.user` / `.team` / `.projects`. It cannot be combined with `watcher.wake.existingSecret`.
+- Security: this mode needs `create` on `accesskeys.storage.loft.sh`, which Kubernetes RBAC cannot limit by name, so the watcher's ServiceAccount can mint keys for any Platform user. It is opt-in, and providing a token stays supported.
+
+### Upgrade Notes
+
+- **Set `WATCH_PLATFORM_HOST`** (`watcher.platformHost` in the chart). It is optional, but gives an exact server match and is required to tell this platform's Secrets apart when several platforms share one Argo CD.
+- **Ambiguous matches are no longer resolved.** When more than one Secret matches by labels or by the name fallback, the watcher now pauses none of them and logs the candidates once, instead of picking one. Setting `WATCH_PLATFORM_HOST` resolves this.
+- **Check your wake token.** It must not be the access key the platform created for the Argo CD integration. Since vCluster Platform v4.12.0 that key carries `sleepmode.loft.sh/ignore-activity`, and wake requests made with it fail with a `502` and never wake the tenant cluster. Use a dedicated access key, or the new managed wake access key.
+- **`sleepmode.loft.sh/ignore-user-agents: argo*` is no longer needed** for platform-registered clusters on vCluster Platform v4.12.0 and later, because the platform already ignores Argo CD integration traffic. It is still the only option for clusters registered with other credentials, and on earlier platform versions.
+- New RBAC is only needed for the managed wake access key. The rules are in the chart and, commented out, in `deploy/watcher-rbac.yaml`.
+
+### Documentation
+
+- New README sections on the matching order, the wake token, the managed wake access key, and sleep mode with Argo CD traffic on vCluster Platform v4.12.0 and later. The latter replaces "Reduced Need for `sleepmode.loft.sh/ignore-user-agents`".
+- The proxy section notes that Argo CD traffic sent through the proxy with the integration access key cannot wake a tenant cluster.
+- New chart README with install examples and a values reference.
+
 ## 1.3.0-rc.0
 
 ### Large Kubernetes List Reliability

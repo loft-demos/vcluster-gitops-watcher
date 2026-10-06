@@ -53,6 +53,12 @@ watcher:
   rbac:
     create: true
 
+  # vCluster Platform host or base URL, for example platform.example.com.
+  # Recommended: matches cluster Secrets by the exact server URL the platform
+  # registers, and is required to tell this platform's Secrets apart when
+  # several platforms share one Argo CD.
+  platformHost: ""
+
   pollInterval: 2s
   projectNamespacePrefixes:
     - p-
@@ -77,10 +83,24 @@ watcher:
     # upstreamBase is ignored.
     useProxy: false
     # Existing Secret holding a vCluster Platform access key for wake requests.
+    # Use a dedicated key, not the Argo CD integration access key: since
+    # vCluster Platform v4.12.0 that key can never wake a sleeping tenant cluster.
     # Still needed with useProxy: the proxy forwards the watcher's Authorization
-    # header upstream.
+    # header upstream. Leave empty when accessKey.user or accessKey.team is set.
     existingSecret: ""
     tokenKey: token
+    # Let the watcher create and maintain its own vCluster Platform AccessKey
+    # for wake requests, instead of providing existingSecret. Set the user or
+    # team the key acts as; it needs access to the tenant clusters to wake.
+    # This grants the watcher create on accesskeys.storage.loft.sh, which can
+    # mint keys for any Platform user, so enable it only where that is accepted.
+    accessKey:
+      user: ""
+      team: ""
+      name: vcluster-gitops-watcher-wake
+      # Projects the key is scoped to; "*" covers every project.
+      projects:
+        - "*"
     timeout: ""
     retryInterval: ""
     # Additional wake response codes treated as accepted, beyond 200 and 202.

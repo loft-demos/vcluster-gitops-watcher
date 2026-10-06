@@ -19,6 +19,21 @@ rules:
     resources: ["virtualclusterinstances/status"]
     verbs: ["patch"]
   {{- end }}
+  {{- $accessKey := .Values.watcher.wake.accessKey }}
+  {{- if and (or .Values.watcher.wake.upstreamBase (and .Values.watcher.wake.useProxy .Values.proxy.enabled)) (or $accessKey.user $accessKey.team) }}
+  # Managed wake AccessKey. Kubernetes RBAC cannot limit create by name.
+  - apiGroups: ["storage.loft.sh"]
+    resources: ["accesskeys"]
+    verbs: ["create"]
+  - apiGroups: ["storage.loft.sh"]
+    resources: ["accesskeys"]
+    resourceNames: [{{ $accessKey.name | quote }}]
+    verbs: ["get", "patch"]
+  - apiGroups: ["storage.loft.sh"]
+    resources: [{{ ternary "users" "teams" (not (empty $accessKey.user)) | quote }}]
+    resourceNames: [{{ default $accessKey.team $accessKey.user | quote }}]
+    verbs: ["get"]
+  {{- end }}
   {{- if .Values.watcher.kargo.enabled }}
   - apiGroups: ["kargo.akuity.io"]
     resources: ["promotions"]

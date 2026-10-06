@@ -51,6 +51,41 @@ roleRef:
   kind: ClusterRole
   name: vcluster-gitops-watcher-vci-status-patch
 ---
+# Optional: only for WATCH_WAKE_ACCESS_KEY_USER / WATCH_WAKE_ACCESS_KEY_TEAM,
+# where the watcher creates its own wake AccessKey. create cannot be limited
+# by name, so this lets the watcher mint keys for any Platform user. Replace
+# gitops-watcher with the configured user (or use teams for a team).
+#
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRole
+# metadata:
+#   name: vcluster-gitops-watcher-wake-accesskey
+# rules:
+#   - apiGroups: ["storage.loft.sh"]
+#     resources: ["accesskeys"]
+#     verbs: ["create"]
+#   - apiGroups: ["storage.loft.sh"]
+#     resources: ["accesskeys"]
+#     resourceNames: ["vcluster-gitops-watcher-wake"]
+#     verbs: ["get", "patch"]
+#   - apiGroups: ["storage.loft.sh"]
+#     resources: ["users"]
+#     resourceNames: ["gitops-watcher"]
+#     verbs: ["get"]
+# ---
+# apiVersion: rbac.authorization.k8s.io/v1
+# kind: ClusterRoleBinding
+# metadata:
+#   name: vcluster-gitops-watcher-wake-accesskey
+# subjects:
+#   - kind: ServiceAccount
+#     name: vcluster-gitops-watcher
+#     namespace: argocd
+# roleRef:
+#   apiGroup: rbac.authorization.k8s.io
+#   kind: ClusterRole
+#   name: vcluster-gitops-watcher-wake-accesskey
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:

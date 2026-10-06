@@ -1,4 +1,6 @@
 # Optional Secret for direct watcher -> vCluster Platform wake requests.
+# Use a dedicated access key, not the Argo CD integration access key: since
+# vCluster Platform v4.12.0 that key can never wake a sleeping tenant cluster.
 # Uncomment and replace the placeholder token if you want the watcher to call the
 # platform API directly via WATCH_WAKE_UPSTREAM_BASE instead of going through cmd/proxy.
 #
@@ -31,7 +33,7 @@ spec:
       serviceAccountName: vcluster-gitops-watcher
       containers:
         - name: watcher
-          image: ghcr.io/loft-demos/vcluster-gitops-watcher:1.3.0-rc.0
+          image: ghcr.io/loft-demos/vcluster-gitops-watcher:2.0.0-rc.1
           imagePullPolicy: IfNotPresent
           env:
             - name: ARGOCD_NAMESPACE
@@ -53,6 +55,12 @@ spec:
             # pins a single template if you need to override auto-detection.
             # - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATE
             #   value: "loft-{project}-vcluster-{virtualcluster}"
+            # Recommended: your vCluster Platform host. Lets the watcher match
+            # cluster Secrets by the exact server URL the platform registers,
+            # and keeps it from matching another platform's Secrets when
+            # several platforms share this Argo CD.
+            # - name: WATCH_PLATFORM_HOST
+            #   value: "platform.example.com"
             - name: WATCH_POLL_INTERVAL
               value: "2s"
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
@@ -69,6 +77,12 @@ spec:
             #   value: "/var/run/secrets/platform/token"
             # - name: WATCH_WAKE_TIMEOUT
             #   value: "10s"
+            # Alternatively, let the watcher create and maintain its own Platform
+            # AccessKey for wake requests, acting as this Platform user, in place
+            # of WATCH_WAKE_TOKEN_PATH. Requires the AccessKey RBAC from
+            # deploy/watcher-rbac.yaml.
+            # - name: WATCH_WAKE_ACCESS_KEY_USER
+            #   value: "gitops-watcher"
             # - name: WATCH_WAKE_RETRY_INTERVAL
             #   value: "30s"
             # Optional: after a successful wake request, patch

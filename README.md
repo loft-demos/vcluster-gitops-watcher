@@ -54,7 +54,14 @@ vCluster Platform has two ways of registering a tenant cluster with Argo CD, and
 - **v1 (legacy):** the platform itself creates the Argo CD cluster Secret with a deterministic `metadata.name` such as `loft-<project>-vcluster-<virtualcluster>`.
 - **v2 ("connector"):** the platform registers the cluster through the Argo CD REST API (`POST /api/v1/clusters`). Argo CD still persists a cluster Secret, but it **auto-generates** the `metadata.name` (for example `cluster-<host>-<hash>`), and the cluster name (the Secret `data.name`) uses the `virtualcluster` infix with an `-argocd` suffix, for example `loft-default-virtualcluster-llm-large-argocd`.
 
-Because the v2 `metadata.name` is unpredictable, the watcher does **not** look up Secrets by name. Instead it lists Secrets by the `argocd.argoproj.io/secret-type=cluster` label and matches on the decoded `data.name` and `data.server`. Each configured template is tried both bare and with the `-argocd` suffix. This single discovery path works for both integrations, so v1 behavior is unchanged while v2 clusters resolve to their real Secret for the same skip-reconcile pause/wake lifecycle.
+Because the v2 `metadata.name` is unpredictable, the watcher does **not** look up Secrets by name. Instead it lists Secrets by the `argocd.argoproj.io/secret-type=cluster` label and resolves each `VirtualClusterInstance` in this order:
+
+1. **Exact `data.name`.** The VCI annotation `loft.sh/argocd-registered-cluster-name`, which the platform writes after a successful v2 registration, is tried first, then each configured template bare and with the `-argocd` suffix.
+2. **Platform labels.** Both integrations label the cluster Secret with `loft.sh/vcluster-instance-name` and `loft.sh/vcluster-instance-namespace`. A match is used only when exactly one Secret carries the VCI's labels.
+3. **Server URL.** With `WATCH_PLATFORM_HOST` set, the watcher derives the server the platform registers, `https://<platform-host>/kubernetes/project/<project>/virtualcluster/<name>`. Servers on matching Applications are tried next.
+4. **Name fallback.** On a licensed platform, v2 names end with a 6-character hash of the platform instance ID (for example `loft-default-virtualcluster-llm-argocd-1a2b3c`), and long names are truncated to 49 characters. The watcher accepts a hash-suffix or truncated-prefix match only when exactly one Secret matches, and logs it.
+
+If several platforms share one Argo CD, steps 2 and 4 can match another platform's Secret for a tenant cluster with the same project and name. The watcher refuses to pick between them and logs the candidates. Set `WATCH_PLATFORM_HOST` so those steps only consider Secrets whose server points at this platform.
 
 The Application destination also differs in v2: plain Argo CD sets `spec.destination.server` (the watcher matches by normalized server URL), while Akuity sets `spec.destination.name` (the watcher matches by name, as in v1). The watcher unions both.
 
@@ -73,23 +80,20 @@ When no patchable cluster Secret can be resolved (for example a fully Akuity-hos
 
 With that watcher-first flow, Argo CD Notifications and Kargo `http` steps are not required for wakeup orchestration.
 
-### Reduced Need for `sleepmode.loft.sh/ignore-user-agents`
+### Sleep Mode and Argo CD Traffic
 
-The vCluster sleep documentation describes [`sleepmode.loft.sh/ignore-user-agents`](https://www.vcluster.com/docs/vcluster/key-features/sleep#ignore-other-types-of-activity-in-auto-sleep) as a way to ignore specific request user agents, including wildcard patterns such as `argo*`, when deciding whether traffic should keep a vCluster awake or wake it back up.
+Since vCluster Platform v4.12.0, the access keys the platform creates for the Argo CD integration (both the legacy and the v2 "connector" keys) carry the `sleepmode.loft.sh/ignore-activity` label. Every request Argo CD makes with that key, including cluster health and cache refreshes, `/version` probes, and syncs:
 
-That can be useful as a broad sleep-protection workaround, but it has an important downside for GitOps: when Argo CD is ignored at the sleep layer, an Argo-driven sync request will also not wake the sleeping destination. In practice, that means the same annotation that prevents unwanted Argo traffic from disturbing sleep can also block the desired wake-up path when an `Application` actually needs to deploy.
+- does not reset the tenant cluster's inactivity timer, so tenant clusters can fall asleep while Argo CD polls them, and
+- does not wake a sleeping tenant cluster. The request fails with a `502` instead.
 
-`vcluster-gitops-watcher` is intended to reduce the need to depend on that tradeoff. Instead of relying on Argo traffic to hit a sleeping vCluster directly, the watcher observes Argo CD and optional Kargo intent from the management plane, pauses reconciliation while the destination is sleeping or waking, triggers the wake request explicitly, and only lets Argo continue once the `VirtualClusterInstance` is ready again.
+That makes [`sleepmode.loft.sh/ignore-user-agents`](https://www.vcluster.com/docs/vcluster/key-features/sleep#ignore-other-types-of-activity-in-auto-sleep) unnecessary for platform-registered clusters. It is still the only option for a cluster registered with any other credential, such as a hand-made cluster Secret or a personal access key.
 
-In practice, some environments can still need `sleepmode.loft.sh/ignore-user-agents: argo*` as a fallback while validating that cluster-secret `skip-reconcile` is fully stopping Argo background cluster-cache traffic. If you use that annotation, treat it as a pragmatic compatibility workaround rather than the preferred steady-state design.
+It also means Argo CD can no longer wake a sleeping tenant cluster on its own. The watcher fills that gap: it observes Argo CD and optional Kargo intent from the management plane, sends the wake request with its own token, and only lets Argo CD continue once the `VirtualClusterInstance` is ready again. Without the watcher, a sync to a sleeping tenant cluster simply fails.
 
-For self-hosted Argo CD, this gives a cleaner model:
+The watcher's cluster-secret pause is still worth running alongside the label. While a tenant cluster sleeps, Argo CD otherwise keeps retrying it, collects `502` errors, and marks the cluster connection `Failed`. With `skip-reconcile` set, Argo CD stops reconciling the sleeping destination, and application health shows `Suspended` / `vCluster sleeping` in place of an error.
 
-- `sleepmode.loft.sh/ignore-user-agents: argo*` is often not needed just to keep sleeping vClusters quiet, but it can still be a practical fallback in environments where Argo background traffic continues despite cluster-secret pausing
-- an Argo `Application.operation.sync` can still act as a wake signal when Kargo is not in use
-- a newly observed Argo refresh annotation can also act as an early wake signal before sync intent appears
-- Kargo promotions that end with `argocd-update` can wake even earlier, before Argo finishes writing `Application.operation.sync`
-- Argo reconciles only after the destination is actually ready, and idle ready destinations are re-paused afterward
+On vCluster Platform versions before v4.12.0, Argo CD traffic both keeps tenant clusters awake and wakes them. There, `sleepmode.loft.sh/ignore-user-agents: argo*` can still be a practical fallback, with the tradeoff that an Argo-driven sync will not wake the sleeping destination either. The watcher's explicit wake path covers that case.
 
 ### Watcher Configuration
 
@@ -106,6 +110,7 @@ Important watcher settings:
 | `ARGOCD_NAMESPACE` | `argocd` | Default namespace for Argo CD resources |
 | `ARGOCD_APPLICATION_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where matching `Application` objects live |
 | `ARGOCD_CLUSTER_SECRET_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where imported cluster Secrets live |
+| `WATCH_PLATFORM_HOST` | none | vCluster Platform host or base URL, for example `platform.example.com`. Derives each tenant cluster's Argo CD server URL for an exact match, and restricts label and name-fallback matches to Secrets pointing at this platform. Recommended, and required to disambiguate when several platforms share one Argo CD |
 | `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
 | `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
 | `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches non-Kargo `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
@@ -114,8 +119,12 @@ Important watcher settings:
 | `WATCH_WAKE_UPSTREAM_BASE` | disabled | Optional base URL used to trigger `POST /kubernetes/project/<project>/virtualcluster/<name>` when a sleeping destination has an active Kargo `Promotion`, a new Argo refresh request, or `Application.operation.sync` |
 | `WATCH_WAKE_TIMEOUT` | `10s` | Timeout for the wake request HTTP client |
 | `WATCH_WAKE_SUCCESS_ON` | `502,504` | Comma-separated additional wake response codes treated as accepted, beyond `200` and `202` |
-| `WATCH_WAKE_BEARER_TOKEN` | none | Optional bearer token sent with the wake request |
+| `WATCH_WAKE_BEARER_TOKEN` | none | Optional bearer token sent with the wake request. Must not be the Argo CD integration access key, see [Wake Token](#wake-token) |
 | `WATCH_WAKE_TOKEN_PATH` | none | Optional path to a file containing the bearer token for the wake request |
+| `WATCH_WAKE_ACCESS_KEY_USER` | none | Let the watcher create and maintain its own vCluster Platform AccessKey for wake requests, acting as this Platform user. Replaces `WATCH_WAKE_BEARER_TOKEN` / `WATCH_WAKE_TOKEN_PATH`, see [Managed Wake Access Key](#managed-wake-access-key) |
+| `WATCH_WAKE_ACCESS_KEY_TEAM` | none | Same as `WATCH_WAKE_ACCESS_KEY_USER`, acting as a Platform team. Set only one of the two |
+| `WATCH_WAKE_ACCESS_KEY_NAME` | `vcluster-gitops-watcher-wake` | Name of the managed `storage.loft.sh/v1` AccessKey |
+| `WATCH_WAKE_ACCESS_KEY_PROJECTS` | `*` | Comma-separated projects the managed AccessKey is scoped to; `*` covers every project |
 | `WATCH_WAKE_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle used when `WATCH_WAKE_UPSTREAM_BASE` is `https://...` |
 | `WATCH_WAKE_RETRY_INTERVAL` | `30s` | Minimum delay before retrying a wake request while the same sync intent is still present and the vCluster remains asleep |
 | `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE` | `false` | When set to `true`, best-effort patches `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state |
@@ -137,6 +146,26 @@ Application health patching is enabled by default so non-Kargo apps show a helpf
 If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
 
 When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses Argo-only signals such as `Application.operation.sync`, newly observed refresh annotations, and newly observed `OutOfSync` revisions as fallbacks. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
+
+### Wake Token
+
+Use a dedicated vCluster Platform access key for `WATCH_WAKE_BEARER_TOKEN` / `WATCH_WAKE_TOKEN_PATH`, never the access key the platform created for the Argo CD integration. Since vCluster Platform v4.12.0, integration access keys carry the `sleepmode.loft.sh/ignore-activity` label, and requests made with them never wake a sleeping tenant cluster. A wake request sent with that key fails with a `502` and the cluster stays asleep.
+
+### Managed Wake Access Key
+
+Instead of providing a token, set `WATCH_WAKE_ACCESS_KEY_USER` (or `WATCH_WAKE_ACCESS_KEY_TEAM`) and the watcher creates its own `storage.loft.sh/v1` AccessKey on startup, then uses it for every wake request:
+
+- The key acts as the given Platform user or team, so that user or team needs access to the tenant clusters the watcher wakes. A dedicated Platform user, for example `gitops-watcher`, with access to the relevant projects works well.
+- It is scoped to `WATCH_WAKE_ACCESS_KEY_PROJECTS` and never carries `sleepmode.loft.sh/ignore-activity`.
+- The key value is generated by the watcher and stored only in the AccessKey, so restarts reuse it.
+- If the AccessKey is deleted, disabled, or edited, the watcher repairs or recreates it on startup or on the next wake request that is rejected with `401`.
+- The watcher only manages an AccessKey it created, marked with `app.kubernetes.io/managed-by: vcluster-gitops-watcher`. It refuses to take over an existing AccessKey with the same name.
+
+This needs `create` on `accesskeys.storage.loft.sh`, plus `get` and `patch` on the named key and `get` on the user or team. Kubernetes RBAC cannot restrict `create` by name, so the watcher's ServiceAccount can then mint keys for any Platform user. Grant it only where that is acceptable, and otherwise provide a token. The AccessKey is not deleted when the watcher is removed:
+
+```bash
+kubectl delete accesskeys.storage.loft.sh vcluster-gitops-watcher-wake
+```
 
 When `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE=true`, the watcher also performs a best-effort patch of `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` immediately after a successful wake request. This is intended as a pragmatic workaround for environments where platform UI sleep badges can remain stale after a GitOps-driven wake. To use it, apply the VCI status patch RBAC from [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml).
 
@@ -180,6 +209,8 @@ This Akuity path is additive. It does not change the existing self-hosted
 Its main job is to sit in front of the upstream API and treat the wake-triggering request as "accepted" when the request likely started the wake-up flow, including when the upstream returns `200 OK` or `202 Accepted` with an empty body, a transient `502` or `504`, or a retryable early transport error.
 
 It can also, after a wake request has been accepted, patch the matching Argo CD cluster secret with a fresh `argocd.argoproj.io/refresh` timestamp so Argo invalidates its destination-cluster cache sooner.
+
+Requests the proxy forwards keep the caller's `Authorization` header. On vCluster Platform v4.12.0 and later, a wake request carrying the Argo CD integration access key never wakes a sleeping tenant cluster, so Argo CD traffic sent through the proxy with that key cannot wake one either. Use the proxy with a caller that sends its own access key, such as the watcher.
 
 This is useful for flows where:
 
