@@ -95,6 +95,8 @@ For self-hosted Argo CD, this gives a cleaner model:
 
 Ready-to-apply example manifests are included in [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml) and [deploy/watcher-deployment.yaml](deploy/watcher-deployment.yaml).
 
+A Helm chart covering the watcher and the optional wake proxy is published to `oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher` on each release. See [chart/README.md](chart/README.md).
+
 Important watcher settings:
 
 | Variable | Default | Description |

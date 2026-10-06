@@ -1,0 +1,122 @@
+{{- if .Values.proxy.enabled }}
+{{- $refresh := .Values.proxy.refreshSecret }}
+{{- if and $refresh.namespace (not (or $refresh.name $refresh.nameTemplate)) }}
+{{- fail "proxy.refreshSecret.namespace requires proxy.refreshSecret.name or proxy.refreshSecret.nameTemplate" }}
+{{- end }}
+{{- if and $refresh.name $refresh.nameTemplate }}
+{{- fail "set only one of proxy.refreshSecret.name or proxy.refreshSecret.nameTemplate" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vcluster-gitops-watcher.proxyFullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: {{ .Values.proxy.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "vcluster-gitops-watcher.proxySelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.proxy.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "vcluster-gitops-watcher.proxySelectorLabels" . | nindent 8 }}
+        {{- with .Values.proxy.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vcluster-gitops-watcher.proxyServiceAccountName" . }}
+      # The token is only needed for the post-wake cluster Secret refresh.
+      automountServiceAccountToken: {{ not (empty $refresh.namespace) }}
+      terminationGracePeriodSeconds: {{ .Values.proxy.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.proxy.podSecurityContext | nindent 8 }}
+      containers:
+        - name: proxy
+          image: {{ include "vcluster-gitops-watcher.image" (dict "image" .Values.proxy.image "root" .) | quote }}
+          imagePullPolicy: {{ .Values.proxy.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: UPSTREAM_BASE
+              value: {{ required "proxy.upstreamBase is required when proxy.enabled is true" .Values.proxy.upstreamBase | quote }}
+            - name: LISTEN_ADDR
+              value: ":8080"
+            {{- with .Values.proxy.upstreamTimeout }}
+            - name: UPSTREAM_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: SUCCESS_ON
+              value: {{ .Values.proxy.successOn | quote }}
+            - name: SUCCESS_ON_ERROR
+              value: {{ .Values.proxy.successOnError | quote }}
+            - name: LOG_REQUESTS
+              value: {{ .Values.proxy.logRequests | quote }}
+            {{- with .Values.proxy.wakeReady.timeout }}
+            - name: WAKE_READY_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.wakeReady.interval }}
+            - name: WAKE_READY_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.proxy.wakeReady.path }}
+            - name: WAKE_READY_PATH
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $refresh.namespace }}
+            - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAMESPACE
+              value: {{ $refresh.namespace | quote }}
+            {{- with $refresh.name }}
+            - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAME
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $refresh.nameTemplate }}
+            - name: ARGOCD_CLUSTER_REFRESH_SECRET_NAME_TEMPLATE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.proxy.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          securityContext:
+            {{- toYaml .Values.proxy.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.proxy.resources | nindent 12 }}
+      {{- with .Values.proxy.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.proxy.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

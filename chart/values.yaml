@@ -1,0 +1,204 @@
+nameOverride: ""
+fullnameOverride: ""
+imagePullSecrets: []
+
+# Argo CD settings shared by the watcher and its RBAC. Namespaced RBAC is
+# created in each distinct Argo CD namespace below, not in the release
+# namespace, so the chart can be installed outside of the Argo CD namespace.
+argocd:
+  namespace: argocd
+  # Empty defaults to argocd.namespace.
+  applicationNamespace: ""
+  # Empty defaults to argocd.namespace.
+  clusterSecretNamespace: ""
+  # Ordered list of expected cluster name templates. The default auto-detects
+  # both the v2 ("connector", virtualcluster infix) and legacy v1 (vcluster
+  # infix) conventions. Each template is also tried with the v2 "-argocd" suffix.
+  clusterSecretNameTemplates:
+    - "loft-{project}-virtualcluster-{virtualcluster}"
+    - "loft-{project}-vcluster-{virtualcluster}"
+  # Optional Argo CD REST API discovery/fallback. Only needed when cluster
+  # Secrets or Applications are NOT readable from this cluster (for example a
+  # fully Akuity-hosted Argo CD). The API is never used to pause.
+  api:
+    # Empty disables API discovery.
+    base: ""
+    # Existing Secret holding the Argo CD API token. Required when base is set.
+    existingSecret: ""
+    tokenKey: token
+    # Optional key in the same Secret holding a CA bundle for the API endpoint.
+    caKey: ""
+    insecure: false
+    timeout: ""
+
+watcher:
+  enabled: true
+
+  # Must stay 1: the watcher polls and patches without leader election.
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/loft-demos/vcluster-gitops-watcher
+    # Empty uses Chart.yaml appVersion.
+    tag: ""
+    # Optional sha256 digest. When set, it takes precedence over tag.
+    digest: ""
+    pullPolicy: IfNotPresent
+
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+
+  rbac:
+    create: true
+
+  pollInterval: 2s
+  projectNamespacePrefixes:
+    - p-
+    - loft-p-
+  # Patch non-Kargo Application.status.health to Suspended/Progressing while the
+  # destination is asleep or waking.
+  patchApplicationHealth: true
+  sleepingMessage: ""
+  wakingMessage: ""
+
+  # Grants read access to Kargo Promotions so active argocd-update promotions
+  # can wake sleeping destinations early.
+  kargo:
+    enabled: true
+
+  # Optional direct wake requests. Leave upstreamBase empty and set useProxy
+  # (with proxy.enabled) to route wakes through the bundled wakeup proxy.
+  wake:
+    # vCluster Platform base URL, for example https://platform.example.com.
+    upstreamBase: ""
+    # When true and proxy.enabled is true, wakes go to the proxy Service and
+    # upstreamBase is ignored.
+    useProxy: false
+    # Existing Secret holding a vCluster Platform access key for wake requests.
+    # Still needed with useProxy: the proxy forwards the watcher's Authorization
+    # header upstream.
+    existingSecret: ""
+    tokenKey: token
+    timeout: ""
+    retryInterval: ""
+    # Additional wake response codes treated as accepted, beyond 200 and 202.
+    successOn: ""
+    # Best-effort patch of the VCI sleep lastActivity after a successful wake.
+    # Also adds the virtualclusterinstances/status patch RBAC.
+    updateVCILastActivity: false
+
+  # Additional environment variables, for example WATCH_KUBERNETES_TIMEOUT.
+  extraEnv: []
+  extraVolumes: []
+  extraVolumeMounts: []
+
+  podAnnotations: {}
+  podLabels: {}
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 10
+
+# Optional vcluster-wakeup-proxy. Sits in front of the vCluster Platform API and
+# treats transient 502/504 responses to wake requests as accepted.
+proxy:
+  enabled: false
+
+  replicaCount: 1
+
+  image:
+    repository: ghcr.io/loft-demos/vcluster-wakeup-proxy
+    # Empty uses Chart.yaml appVersion.
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+
+  serviceAccount:
+    create: true
+    annotations: {}
+    name: ""
+
+  # Creates a Role in refreshSecret.namespace that can patch Argo CD cluster
+  # Secrets, used only when refreshSecret is configured.
+  rbac:
+    create: true
+
+  service:
+    type: ClusterIP
+    port: 8080
+
+  # Required when proxy.enabled is true.
+  upstreamBase: ""
+  upstreamTimeout: ""
+  successOn: "502,504"
+  successOnError: true
+
+  wakeReady:
+    # Empty disables the readiness wait.
+    timeout: 30s
+    interval: 2s
+    path: ""
+
+  # Post-wake Argo CD cluster Secret refresh. Set namespace plus exactly one of
+  # name or nameTemplate to enable it.
+  refreshSecret:
+    namespace: ""
+    name: ""
+    nameTemplate: ""
+
+  logRequests: false
+
+  extraEnv: []
+
+  podAnnotations: {}
+  podLabels: {}
+
+  podSecurityContext:
+    runAsNonRoot: true
+    seccompProfile:
+      type: RuntimeDefault
+
+  securityContext:
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: [ALL]
+    readOnlyRootFilesystem: true
+    runAsNonRoot: true
+
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 128Mi
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  priorityClassName: ""
+  terminationGracePeriodSeconds: 10

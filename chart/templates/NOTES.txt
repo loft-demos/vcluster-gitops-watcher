@@ -1,0 +1,18 @@
+{{- if .Values.watcher.enabled }}
+vcluster-gitops-watcher is installed in {{ .Release.Namespace }} and manages Argo CD
+resources in {{ include "vcluster-gitops-watcher.clusterSecretNamespace" . }}{{ if ne (include "vcluster-gitops-watcher.clusterSecretNamespace" .) (include "vcluster-gitops-watcher.applicationNamespace" .) }} (cluster Secrets) and {{ include "vcluster-gitops-watcher.applicationNamespace" . }} (Applications){{ end }}.
+
+Follow the watcher logs:
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "vcluster-gitops-watcher.fullname" . }} -f
+{{- if not (include "vcluster-gitops-watcher.wakeUpstreamBase" .) }}
+
+Wake requests are disabled. Set watcher.wake.upstreamBase (or watcher.wake.useProxy
+with proxy.enabled) and watcher.wake.existingSecret to let the watcher wake sleeping
+tenant clusters on GitOps intent.
+{{- end }}
+{{- end }}
+{{- if .Values.proxy.enabled }}
+
+vcluster-wakeup-proxy is reachable in-cluster at:
+  http://{{ include "vcluster-gitops-watcher.proxyFullname" . }}.{{ .Release.Namespace }}.svc:{{ .Values.proxy.service.port }}
+{{- end }}

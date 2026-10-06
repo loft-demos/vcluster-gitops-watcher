@@ -1,0 +1,87 @@
+{{- if and .Values.watcher.enabled .Values.watcher.rbac.create }}
+{{- $fullname := include "vcluster-gitops-watcher.fullname" . }}
+{{- $sa := include "vcluster-gitops-watcher.watcherServiceAccountName" . }}
+{{- $appNs := include "vcluster-gitops-watcher.applicationNamespace" . }}
+{{- $secretNs := include "vcluster-gitops-watcher.clusterSecretNamespace" . }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+rules:
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances"]
+    verbs: ["get", "list", "watch"]
+  {{- if .Values.watcher.wake.updateVCILastActivity }}
+  - apiGroups: ["management.loft.sh"]
+    resources: ["virtualclusterinstances/status"]
+    verbs: ["patch"]
+  {{- end }}
+  {{- if .Values.watcher.kargo.enabled }}
+  - apiGroups: ["kargo.akuity.io"]
+    resources: ["promotions"]
+    verbs: ["get", "list", "watch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $fullname }}
+{{- range $ns := list $appNs $secretNs | uniq }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: watcher
+rules:
+  {{- if eq $ns $secretNs }}
+  # list discovers cluster Secrets by the argocd.argoproj.io/secret-type=cluster
+  # label (v1 and v2 integrations); patch drives the skip-reconcile pause.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "patch"]
+  {{- end }}
+  {{- if eq $ns $appNs }}
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get", "list", "watch", "patch"]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications/status"]
+    verbs: ["patch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $fullname }}
+  namespace: {{ $ns }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: watcher
+subjects:
+  - kind: ServiceAccount
+    name: {{ $sa }}
+    namespace: {{ $.Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $fullname }}
+{{- end }}
+{{- end }}

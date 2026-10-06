@@ -1,0 +1,180 @@
+{{- if .Values.watcher.enabled }}
+{{- if ne (int .Values.watcher.replicaCount) 1 }}
+{{- fail "watcher.replicaCount must be 1 because the watcher does not implement leader election" }}
+{{- end }}
+{{- $wakeBase := include "vcluster-gitops-watcher.wakeUpstreamBase" . }}
+{{- $wakeToken := and $wakeBase .Values.watcher.wake.existingSecret }}
+{{- $argoAPI := .Values.argocd.api }}
+{{- if and $argoAPI.base (not $argoAPI.existingSecret) }}
+{{- fail "argocd.api.existingSecret is required when argocd.api.base is set" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "vcluster-gitops-watcher.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: watcher
+spec:
+  replicas: 1
+  # Never run two watchers against the same Argo CD at once.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "vcluster-gitops-watcher.watcherSelectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.watcher.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "vcluster-gitops-watcher.watcherSelectorLabels" . | nindent 8 }}
+        {{- with .Values.watcher.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "vcluster-gitops-watcher.watcherServiceAccountName" . }}
+      # The watcher calls the Kubernetes API with its service-account token.
+      automountServiceAccountToken: true
+      terminationGracePeriodSeconds: {{ .Values.watcher.terminationGracePeriodSeconds }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watcher.priorityClassName }}
+      priorityClassName: {{ . | quote }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.watcher.podSecurityContext | nindent 8 }}
+      containers:
+        - name: watcher
+          image: {{ include "vcluster-gitops-watcher.image" (dict "image" .Values.watcher.image "root" .) | quote }}
+          imagePullPolicy: {{ .Values.watcher.image.pullPolicy }}
+          env:
+            - name: ARGOCD_NAMESPACE
+              value: {{ .Values.argocd.namespace | quote }}
+            - name: ARGOCD_APPLICATION_NAMESPACE
+              value: {{ include "vcluster-gitops-watcher.applicationNamespace" . | quote }}
+            - name: ARGOCD_CLUSTER_SECRET_NAMESPACE
+              value: {{ include "vcluster-gitops-watcher.clusterSecretNamespace" . | quote }}
+            {{- with .Values.argocd.clusterSecretNameTemplates }}
+            - name: ARGOCD_CLUSTER_SECRET_NAME_TEMPLATES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            - name: WATCH_POLL_INTERVAL
+              value: {{ .Values.watcher.pollInterval | quote }}
+            - name: WATCH_PROJECT_NAMESPACE_PREFIXES
+              value: {{ join "," .Values.watcher.projectNamespacePrefixes | quote }}
+            - name: WATCH_PATCH_APPLICATION_HEALTH
+              value: {{ .Values.watcher.patchApplicationHealth | quote }}
+            {{- with .Values.watcher.sleepingMessage }}
+            - name: WATCH_SLEEPING_MESSAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.watcher.wakingMessage }}
+            - name: WATCH_WAKING_MESSAGE
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $wakeBase }}
+            - name: WATCH_WAKE_UPSTREAM_BASE
+              value: {{ $wakeBase | quote }}
+            {{- with .Values.watcher.wake.timeout }}
+            - name: WATCH_WAKE_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.watcher.wake.retryInterval }}
+            - name: WATCH_WAKE_RETRY_INTERVAL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.watcher.wake.successOn }}
+            - name: WATCH_WAKE_SUCCESS_ON
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if $wakeToken }}
+            - name: WATCH_WAKE_TOKEN_PATH
+              value: /var/run/secrets/platform/token
+            {{- end }}
+            - name: WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE
+              value: {{ .Values.watcher.wake.updateVCILastActivity | quote }}
+            {{- end }}
+            {{- if $argoAPI.base }}
+            - name: ARGOCD_API_BASE
+              value: {{ $argoAPI.base | quote }}
+            - name: ARGOCD_API_TOKEN_PATH
+              value: /var/run/secrets/argocd/token
+            {{- if $argoAPI.caKey }}
+            - name: ARGOCD_API_CA_PATH
+              value: /var/run/secrets/argocd/ca.crt
+            {{- end }}
+            - name: ARGOCD_API_INSECURE
+              value: {{ $argoAPI.insecure | quote }}
+            {{- with $argoAPI.timeout }}
+            - name: ARGOCD_API_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with .Values.watcher.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if or $wakeToken $argoAPI.base .Values.watcher.extraVolumeMounts }}
+          volumeMounts:
+            {{- if $wakeToken }}
+            - name: platform-token
+              mountPath: /var/run/secrets/platform
+              readOnly: true
+            {{- end }}
+            {{- if $argoAPI.base }}
+            - name: argocd-api
+              mountPath: /var/run/secrets/argocd
+              readOnly: true
+            {{- end }}
+            {{- with .Values.watcher.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.watcher.securityContext | nindent 12 }}
+          resources:
+            {{- toYaml .Values.watcher.resources | nindent 12 }}
+      {{- if or $wakeToken $argoAPI.base .Values.watcher.extraVolumes }}
+      volumes:
+        {{- if $wakeToken }}
+        - name: platform-token
+          secret:
+            secretName: {{ .Values.watcher.wake.existingSecret }}
+            items:
+              - key: {{ .Values.watcher.wake.tokenKey }}
+                path: token
+        {{- end }}
+        {{- if $argoAPI.base }}
+        - name: argocd-api
+          secret:
+            secretName: {{ $argoAPI.existingSecret }}
+            items:
+              - key: {{ $argoAPI.tokenKey }}
+                path: token
+              {{- with $argoAPI.caKey }}
+              - key: {{ . }}
+                path: ca.crt
+              {{- end }}
+        {{- end }}
+        {{- with .Values.watcher.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.watcher.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watcher.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.watcher.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

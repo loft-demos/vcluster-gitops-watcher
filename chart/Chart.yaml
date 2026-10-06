@@ -1,0 +1,18 @@
+apiVersion: v2
+name: vcluster-gitops-watcher
+description: >-
+  Pauses Argo CD reconciliation for sleeping tenant clusters and wakes them on
+  GitOps intent (Argo CD sync/refresh, Kargo promotions). Optionally deploys the
+  tolerant vcluster-wakeup-proxy.
+type: application
+version: 1.3.0-rc.0
+appVersion: "1.3.0-rc.0"
+home: https://github.com/loft-demos/vcluster-gitops-watcher
+sources:
+  - https://github.com/loft-demos/vcluster-gitops-watcher
+keywords:
+  - vcluster-platform
+  - argocd
+  - kargo
+  - sleep-mode
+  - gitops

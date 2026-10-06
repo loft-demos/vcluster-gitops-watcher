@@ -1,0 +1,40 @@
+{{- if and .Values.proxy.enabled .Values.proxy.rbac.create .Values.proxy.refreshSecret.namespace }}
+{{- $name := include "vcluster-gitops-watcher.proxyFullname" . }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.proxy.refreshSecret.namespace }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+rules:
+  {{- if .Values.proxy.refreshSecret.name }}
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: [{{ .Values.proxy.refreshSecret.name | quote }}]
+    verbs: ["patch"]
+  {{- else }}
+  # Templated cluster Secret names cannot be enumerated with resourceNames.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["patch"]
+  {{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Values.proxy.refreshSecret.namespace }}
+  labels:
+    {{- include "vcluster-gitops-watcher.labels" . | nindent 4 }}
+    app.kubernetes.io/component: proxy
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "vcluster-gitops-watcher.proxyServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $name }}
+{{- end }}
