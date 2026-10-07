@@ -112,6 +112,7 @@ Important watcher settings:
 | `ARGOCD_CLUSTER_SECRET_NAMESPACE` | `ARGOCD_NAMESPACE` | Namespace where imported cluster Secrets live |
 | `WATCH_PLATFORM_HOST` | none | vCluster Platform host or base URL, for example `platform.example.com`. Derives each tenant cluster's Argo CD server URL for an exact match, and restricts label and name-fallback matches to Secrets pointing at this platform. Recommended, and required to disambiguate when several platforms share one Argo CD |
 | `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
+| `WATCH_READY_REFRESH_GRACE` | `2m` | After the watcher un-pauses a ready destination, how long a pending Argo CD `refresh` annotation keeps it un-paused. It is re-paused as soon as Argo CD clears the annotation, or when this runs out |
 | `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
 | `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches non-Kargo `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
 | `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |

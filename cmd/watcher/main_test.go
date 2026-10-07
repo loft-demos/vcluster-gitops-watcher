@@ -2646,3 +2646,153 @@ func TestLoadWatcherConfigReadsWakeDefaultAndPrefix(t *testing.T) {
 		t.Fatalf("unexpected config: default=%q annotation=%q", cfg.wakeDefault, cfg.wakeAnnotation())
 	}
 }
+
+// readyRefreshGraceFixture is a ready VCI whose cluster Secret starts paused,
+// with one Application that carries watcher-managed sleeping health (so the
+// first ready pass un-pauses for a one-time refresh) and a pending refresh
+// annotation, as vCluster Platform leaves when it refreshes an app to wake a
+// tenant cluster. The fake API tracks the Secret's pause state across passes.
+type readyRefreshGraceFixture struct {
+	t             *testing.T
+	cfg           watcherConfig
+	runtime       *watcherRuntime
+	vci           virtualClusterInstance
+	apps          map[string][]application
+	secretPaused  bool
+	secretPatches int
+}
+
+const readyRefreshGraceSecret = "loft-demo-vcluster-team-a"
+
+func newReadyRefreshGraceFixture(t *testing.T, grace time.Duration) *readyRefreshGraceFixture {
+	f := &readyRefreshGraceFixture{t: t, secretPaused: true}
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+readyRefreshGraceSecret):
+			f.secretPatches++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read secret patch body: %v", err)
+			}
+			f.secretPaused = strings.Contains(string(body), `"argocd.argoproj.io/skip-reconcile":"true"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodPatch && strings.Contains(r.URL.Path, "/applications/frontend"):
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	t.Cleanup(apiServer.Close)
+
+	f.cfg = watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+		patchApplicationHealth:       true,
+		sleepingHealthMessage:        "vCluster sleeping",
+		wakingHealthMessage:          "vCluster waking",
+		readyRefreshGrace:            grace,
+	}
+	f.runtime = newWatcherRuntime()
+	f.vci = virtualClusterInstance{
+		Metadata: metadata{Name: "team-a", Namespace: "p-demo"},
+		Status: virtualClusterStatus{
+			Phase:      "Ready",
+			Conditions: []condition{{Type: virtualClusterOnlineConditionType, Status: "True"}},
+		},
+	}
+	f.apps = map[string][]application{
+		readyRefreshGraceSecret: {
+			{
+				Metadata: metadata{
+					Name:            "frontend",
+					ResourceVersion: "7",
+					Annotations:     map[string]string{argocdClusterRefreshAnnotation: "hard"},
+				},
+				Status: applicationStatus{
+					Health: healthStatus{Status: "Suspended", Message: "vCluster sleeping"},
+				},
+			},
+		},
+	}
+	return f
+}
+
+func (f *readyRefreshGraceFixture) pass(name string) {
+	f.t.Helper()
+	idx := reconcileIndexForTest(f.apps, []secret{clusterSecretForTest(readyRefreshGraceSecret, "", f.secretPaused)}, nil)
+	if err := reconcileVCI(context.Background(), &f.cfg, f.runtime, f.vci, idx); err != nil {
+		f.t.Fatalf("unexpected reconcile error on %s: %v", name, err)
+	}
+}
+
+// argoCDReconciled simulates Argo CD processing the app: it clears the refresh
+// annotation and reports real health.
+func (f *readyRefreshGraceFixture) argoCDReconciled() {
+	app := &f.apps[readyRefreshGraceSecret][0]
+	app.Metadata.Annotations = map[string]string{}
+	app.Metadata.ResourceVersion = "8"
+	app.Status.Health = healthStatus{Status: "Healthy"}
+}
+
+// Regression: the watcher un-paused a ready destination for a one-time refresh
+// and re-paused it on the next poll, seconds later, before Argo CD had
+// reconciled the app. The app's pending refresh then sat behind skip-reconcile
+// indefinitely.
+func TestReconcileVCIKeepsReadyClusterUnpausedWhileRefreshPendingInGrace(t *testing.T) {
+	f := newReadyRefreshGraceFixture(t, 2*time.Minute)
+
+	f.pass("first ready pass")
+	if f.secretPaused || f.secretPatches != 1 {
+		t.Fatalf("expected the first ready pass to un-pause the cluster, paused=%v patches=%d", f.secretPaused, f.secretPatches)
+	}
+
+	f.pass("second ready pass")
+	if f.secretPaused || f.secretPatches != 1 {
+		t.Fatalf("expected the cluster to stay un-paused while the refresh is pending, paused=%v patches=%d", f.secretPaused, f.secretPatches)
+	}
+
+	f.argoCDReconciled()
+	f.pass("pass after Argo CD reconciled")
+	if !f.secretPaused || f.secretPatches != 2 {
+		t.Fatalf("expected a re-pause once Argo CD cleared the refresh, paused=%v patches=%d", f.secretPaused, f.secretPatches)
+	}
+}
+
+// A refresh annotation that never clears must not keep the destination
+// un-paused past the grace (the reason refresh requests are not active work).
+func TestReconcileVCIRepausesReadyClusterWhenRefreshOutlivesGrace(t *testing.T) {
+	f := newReadyRefreshGraceFixture(t, 2*time.Minute)
+
+	f.pass("first ready pass")
+	if f.secretPaused {
+		t.Fatalf("expected the first ready pass to un-pause the cluster")
+	}
+
+	f.runtime.readyUnpausedAt[readyRefreshGraceSecret] = time.Now().Add(-3 * time.Minute)
+	f.pass("pass after grace")
+	if !f.secretPaused || f.secretPatches != 2 {
+		t.Fatalf("expected a re-pause once the grace ran out, paused=%v patches=%d", f.secretPaused, f.secretPatches)
+	}
+	if _, ok := f.runtime.readyUnpausedAt[readyRefreshGraceSecret]; ok {
+		t.Fatalf("expected readyUnpausedAt to be cleared on re-pause")
+	}
+}
+
+// With the grace disabled the pre-2.1.1 behavior is unchanged: re-pause on the
+// next pass.
+func TestReconcileVCIRepausesReadyClusterImmediatelyWhenGraceDisabled(t *testing.T) {
+	f := newReadyRefreshGraceFixture(t, 0)
+
+	f.pass("first ready pass")
+	f.pass("second ready pass")
+	if !f.secretPaused || f.secretPatches != 2 {
+		t.Fatalf("expected an immediate re-pause with the grace disabled, paused=%v patches=%d", f.secretPaused, f.secretPatches)
+	}
+}

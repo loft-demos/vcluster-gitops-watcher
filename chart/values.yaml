@@ -60,6 +60,11 @@ watcher:
   platformHost: ""
 
   pollInterval: 2s
+  # After the watcher un-pauses a ready tenant cluster, how long a pending Argo
+  # CD refresh annotation keeps it un-paused while Argo CD gets to it. The
+  # cluster is re-paused as soon as Argo CD clears the annotation, or when this
+  # runs out, so a stale annotation can't keep it un-paused forever.
+  readyRefreshGrace: 2m
   projectNamespacePrefixes:
     - p-
     - loft-p-
@@ -143,6 +148,10 @@ watcher:
 
   podSecurityContext:
     runAsNonRoot: true
+    # The distroless image's user is the name "nonroot"; Kubernetes can only
+    # verify runAsNonRoot against a numeric user. 65532 is distroless nonroot.
+    runAsUser: 65532
+    runAsGroup: 65532
     seccompProfile:
       type: RuntimeDefault
 
@@ -223,6 +232,10 @@ proxy:
 
   podSecurityContext:
     runAsNonRoot: true
+    # The distroless image's user is the name "nonroot"; Kubernetes can only
+    # verify runAsNonRoot against a numeric user. 65532 is distroless nonroot.
+    runAsUser: 65532
+    runAsGroup: 65532
     seccompProfile:
       type: RuntimeDefault
 

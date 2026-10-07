@@ -1,5 +1,31 @@
 # Release Notes
 
+## 2.1.1-rc.1
+
+Two fixes. The `CreateContainerConfigError` fix was prepared as 2.1.0-rc.2, which was never published, so it ships here.
+
+### Fixed: a refresh-triggered wake could leave Argo CD paused before it reconciled
+
+When something set `argocd.argoproj.io/refresh` on an Application for a sleeping tenant cluster (vCluster Platform does this when a Stack task refreshes its app), the watcher woke the VCI and un-paused its cluster Secret once it was ready. On the next poll, about two seconds later, it saw no sync or revision work and re-applied `skip-reconcile`, before Argo CD had reconciled the app. The refresh then stayed pending behind the pause, and Stack tasks that waited on it failed with `RefreshApplicationFailed`. Repeating the same refresh did nothing, because the watcher had already seen that refresh request.
+
+- After the watcher un-pauses a ready destination, a pending `refresh` annotation now keeps it un-paused until Argo CD clears the annotation, for at most `WATCH_READY_REFRESH_GRACE` (default `2m`, chart `watcher.readyRefreshGrace`). The same window also stops `sync` mode from putting the VCI back to sleep mid-refresh.
+- Refresh annotations are still edge-triggered wake signals, not persistent work: one that outlives the grace no longer holds the pause off, and the watcher logs `re-paused ... with a refresh still pending after <grace>`.
+- To recover an app stuck by this bug, upgrade, then refresh it again. The new watcher process has no record of the earlier refresh request, so it wakes the VCI again.
+
+### Fixed: the chart's default install failed with CreateContainerConfigError
+
+The chart sets `runAsNonRoot: true`, but the watcher and proxy images ran as the distroless user named `nonroot`. Kubernetes can only verify `runAsNonRoot` against a numeric user, so with the chart defaults the pod never started:
+
+```
+container has runAsNonRoot and image has non-numeric user (nonroot), cannot verify user is non-root
+```
+
+- The chart now sets `runAsUser: 65532` and `runAsGroup: 65532` (distroless `nonroot`) in the default `podSecurityContext` for both the watcher and the proxy.
+- Both images now declare `USER 65532:65532`, so `runAsNonRoot` also works outside the chart.
+
+No configuration changes are needed. If you worked around this by setting `podSecurityContext.runAsUser` / `runAsGroup` yourself, you can remove those values.
+
+
 ## 2.1.0-rc.1
 
 This release gives you control over which tenant clusters the watcher wakes, adds a mode that wakes a tenant cluster for a deploy and puts it straight back to sleep afterwards, and replaces the managed wake access key with short-lived tokens that need far fewer permissions.

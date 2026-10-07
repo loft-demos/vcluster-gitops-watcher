@@ -98,6 +98,10 @@ spec:
             {{- end }}
             - name: WATCH_POLL_INTERVAL
               value: {{ .Values.watcher.pollInterval | quote }}
+            {{- with .Values.watcher.readyRefreshGrace }}
+            - name: WATCH_READY_REFRESH_GRACE
+              value: {{ . | quote }}
+            {{- end }}
             - name: WATCH_PROJECT_NAMESPACE_PREFIXES
               value: {{ join "," .Values.watcher.projectNamespacePrefixes | quote }}
             - name: WATCH_PATCH_APPLICATION_HEALTH

@@ -23,6 +23,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM gcr.io/distroless/base-debian12:nonroot
 WORKDIR /app
 COPY --from=build /out/proxy /app/proxy
-USER nonroot:nonroot
+# Numeric so Kubernetes can verify runAsNonRoot (65532 is distroless "nonroot").
+USER 65532:65532
 EXPOSE 8080
 ENTRYPOINT ["/app/proxy"]

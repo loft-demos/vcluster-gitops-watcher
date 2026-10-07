@@ -46,8 +46,11 @@ const (
 	defaultKubernetesServiceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 	defaultKubernetesServiceAccountCAPath    = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 	defaultWakeRetryInterval                 = 30 * time.Second
-	defaultKubernetesListPageSize            = 50
-	maxAPIResponseBodyBytes                  = 16 << 20
+	// defaultReadyRefreshGrace bounds how long a pending refresh annotation
+	// keeps a just-un-paused ready destination un-paused.
+	defaultReadyRefreshGrace      = 2 * time.Minute
+	defaultKubernetesListPageSize = 50
+	maxAPIResponseBodyBytes       = 16 << 20
 
 	argocdClusterSecretTypeLabelSelector = "argocd.argoproj.io/secret-type=cluster"
 
@@ -120,6 +123,12 @@ type watcherConfig struct {
 	// sleepAfterSyncTimeout and sleepAfterSyncSettle tune wakeModeSync.
 	sleepAfterSyncTimeout time.Duration
 	sleepAfterSyncSettle  time.Duration
+	// readyRefreshGrace is WATCH_READY_REFRESH_GRACE: after the watcher
+	// un-pauses a ready destination, how long a pending refresh annotation
+	// keeps it un-paused while Argo CD gets to it. The env var must be
+	// positive; a zero value (only possible in code) disables the grace and
+	// re-pauses as soon as no other work is pending.
+	readyRefreshGrace time.Duration
 	// annotationPrefix is the domain prefix of the watcher's VCI annotations.
 	annotationPrefix            string
 	argoCDAPI                   *argoCDAPIClient
@@ -152,11 +161,14 @@ type wakeRequester struct {
 }
 
 type watcherRuntime struct {
-	observedSyncIntents      map[string]string
-	observedRefreshRequests  map[string]string
-	observedRevisionWakes    map[string]string
-	observedKargoPromotions  map[string]string
-	observedReadyRefreshes   map[string]bool
+	observedSyncIntents     map[string]string
+	observedRefreshRequests map[string]string
+	observedRevisionWakes   map[string]string
+	observedKargoPromotions map[string]string
+	observedReadyRefreshes  map[string]bool
+	// readyUnpausedAt records when the watcher last un-paused a ready
+	// destination, to bound how long a pending refresh keeps it un-paused.
+	readyUnpausedAt          map[string]time.Time
 	lastWakeAttempt          map[string]time.Time
 	lastKnownKargoHealth     map[string]healthStatus
 	prefixMatchLogged        map[string]bool
@@ -1048,6 +1060,10 @@ func loadWatcherConfig() (watcherConfig, error) {
 	if err != nil {
 		return watcherConfig{}, err
 	}
+	readyRefreshGrace, err := parsePositiveDuration("WATCH_READY_REFRESH_GRACE", defaultReadyRefreshGrace)
+	if err != nil {
+		return watcherConfig{}, err
+	}
 	wakeSubject := strings.TrimSpace(os.Getenv("WATCH_WAKE_SUBJECT"))
 	if wakeSubject == "" && wakeIdentity != nil {
 		wakeSubject = wakeIdentity.activitySubject()
@@ -1094,6 +1110,7 @@ func loadWatcherConfig() (watcherConfig, error) {
 		wakeSubject:                  wakeSubject,
 		sleepAfterSyncTimeout:        sleepAfterSyncTimeout,
 		sleepAfterSyncSettle:         sleepAfterSyncSettle,
+		readyRefreshGrace:            readyRefreshGrace,
 		annotationPrefix:             annotationPrefix,
 		updateVCILastActivityOnWake:  strings.EqualFold(mustEnv("WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE", "false"), "true"),
 		patchApplicationHealth:       !strings.EqualFold(mustEnv("WATCH_PATCH_APPLICATION_HEALTH", "true"), "false"),
@@ -1189,6 +1206,7 @@ func newWatcherRuntime() *watcherRuntime {
 		observedRevisionWakes:   map[string]string{},
 		observedKargoPromotions: map[string]string{},
 		observedReadyRefreshes:  map[string]bool{},
+		readyUnpausedAt:         map[string]time.Time{},
 		lastWakeAttempt:         map[string]time.Time{},
 		lastKnownKargoHealth:    map[string]healthStatus{},
 		prefixMatchLogged:       map[string]bool{},
@@ -2427,6 +2445,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	switch state {
 	case vciStateSleeping:
 		delete(runtime.observedReadyRefreshes, runtimeKey)
+		delete(runtime.readyUnpausedAt, runtimeKey)
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if pauseEnabled && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, true); err != nil {
@@ -2531,6 +2550,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		}
 	case vciStateWaking:
 		delete(runtime.observedReadyRefreshes, runtimeKey)
+		delete(runtime.readyUnpausedAt, runtimeKey)
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -2554,6 +2574,17 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		needsReadyRefresh := applicationsNeedReadyRefresh(apps, *cfg)
 		needsOneTimeReadyRefresh := needsReadyRefresh && !runtime.observedReadyRefreshes[runtimeKey]
 		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh
+		// Refresh annotations are edge-triggered wake signals, not persistent
+		// work: a stale one must not keep the destination un-paused forever.
+		// But right after the watcher un-pauses, a pending refresh (its own
+		// one-time hard refresh, or one vCluster Platform set to trigger the
+		// wake) still needs Argo CD to reconcile, which takes longer than one
+		// poll. Hold the pause off until Argo CD clears the annotation or the
+		// grace runs out.
+		refreshPendingInGrace := false
+		if unpausedAt, ok := runtime.readyUnpausedAt[runtimeKey]; ok && len(refreshRequestApps) > 0 && cfg.readyRefreshGrace > 0 {
+			refreshPendingInGrace = time.Since(unpausedAt) < cfg.readyRefreshGrace
+		}
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
@@ -2564,6 +2595,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			}
 			log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
 			secretPaused = false
+			runtime.readyUnpausedAt[runtimeKey] = time.Now()
 		}
 
 		if needsOneTimeReadyRefresh {
@@ -2580,18 +2612,24 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				return err
 			}
 		}
-		if pauseEnabled && !secretPaused && !shouldUnpauseReadyCluster {
+		if pauseEnabled && !secretPaused && !shouldUnpauseReadyCluster && !refreshPendingInGrace {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, true); err != nil {
 				return fmt.Errorf("pause idle ready cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretMetaName, err)
 			}
-			log.Printf("re-paused idle ready cluster secret %s/%s for VCI %s/%s", cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
+			if _, ok := runtime.readyUnpausedAt[runtimeKey]; ok && len(refreshRequestApps) > 0 {
+				log.Printf("re-paused idle ready cluster secret %s/%s for VCI %s/%s with a refresh still pending after %s", cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name, cfg.readyRefreshGrace)
+			} else {
+				log.Printf("re-paused idle ready cluster secret %s/%s for VCI %s/%s", cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
+			}
+			delete(runtime.readyUnpausedAt, runtimeKey)
 		}
 		delete(runtime.lastWakeAttempt, runtimeKey)
-		if err := sleepAfterSyncIfDone(ctx, cfg, runtime, vci, runtimeKey, apps, hasActiveWork); err != nil {
+		if err := sleepAfterSyncIfDone(ctx, cfg, runtime, vci, runtimeKey, apps, hasActiveWork || refreshPendingInGrace); err != nil {
 			return err
 		}
 	case vciStateUnknown:
 		delete(runtime.observedReadyRefreshes, runtimeKey)
+		delete(runtime.readyUnpausedAt, runtimeKey)
 		if pauseEnabled && !secretPaused && !hasActiveWork {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, true); err != nil {
 				return fmt.Errorf("pause cluster secret %s/%s during unknown state: %w", cfg.argocdClusterSecretNamespace, secretMetaName, err)
