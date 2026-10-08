@@ -2988,3 +2988,101 @@ func TestReconcileVCIDoesNotWakeSleepingClusterForApplicationsAwaitingFirstRecon
 		t.Fatalf("expected no wake for a never-reconciled application, got %d", wakeCalls)
 	}
 }
+
+func TestApplicationRollingOut(t *testing.T) {
+	cfg := watcherConfig{sleepingHealthMessage: "vCluster sleeping", wakingHealthMessage: "vCluster waking"}
+	cases := map[string]struct {
+		status applicationStatus
+		want   bool
+	}{
+		"progressing":                  {applicationStatus{Health: healthStatus{Status: "Progressing"}}, true},
+		"sync operation running":       {applicationStatus{Health: healthStatus{Status: "Healthy"}, OperationState: &applicationOperationState{Phase: "Running"}}, true},
+		"healthy":                      {applicationStatus{Health: healthStatus{Status: "Healthy"}, OperationState: &applicationOperationState{Phase: "Succeeded"}}, false},
+		"degraded":                     {applicationStatus{Health: healthStatus{Status: "Degraded"}}, false},
+		"watcher-patched while waking": {applicationStatus{Health: healthStatus{Status: "Progressing", Message: "vCluster waking"}}, false},
+	}
+	for name, tc := range cases {
+		if got := applicationRollingOut(application{Status: tc.status}, cfg); got != tc.want {
+			t.Errorf("%s: applicationRollingOut = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// Argo CD reconciled the Application once and recorded Progressing. Only another
+// reconcile moves it to Healthy, so the destination must stay un-paused.
+func TestReconcileVCIDoesNotPauseReadyClusterWhileApplicationIsProgressing(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	app := application{
+		Metadata: metadata{Name: "gpu-operator", ResourceVersion: "3"},
+		Status: applicationStatus{
+			ReconciledAt:   "2026-10-08T15:26:06Z",
+			Sync:           applicationSync{Status: "Synced", Revision: "v26.3.3"},
+			Health:         healthStatus{Status: "Progressing"},
+			OperationState: &applicationOperationState{Phase: "Succeeded"},
+		},
+	}
+	idx := reconcileIndexForTest(map[string][]application{secretName: {app}}, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 0 {
+		t.Fatalf("expected no pause while an application is still Progressing, got %v", patches)
+	}
+}
+
+func TestReconcileVCIUnpausesReadyClusterFrozenAtProgressing(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	app := application{
+		Metadata: metadata{Name: "gpu-operator", ResourceVersion: "3"},
+		Status: applicationStatus{
+			ReconciledAt: "2026-10-08T15:26:06Z",
+			Sync:         applicationSync{Status: "Synced", Revision: "v26.3.3"},
+			Health:       healthStatus{Status: "Progressing"},
+		},
+	}
+	idx := reconcileIndexForTest(map[string][]application{secretName: {app}}, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 1 || patches[0] {
+		t.Fatalf("expected one resume patch for a paused cluster frozen at Progressing, got %v", patches)
+	}
+}
+
+func TestReconcileVCIDoesNotPauseReadyClusterWhileSyncOperationRuns(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	app := application{
+		Metadata: metadata{Name: "gpu-operator", ResourceVersion: "3"},
+		Status: applicationStatus{
+			ReconciledAt:   "2026-10-08T15:24:00Z",
+			Sync:           applicationSync{Status: "Synced", Revision: "v26.3.3"},
+			Health:         healthStatus{Status: "Healthy"},
+			OperationState: &applicationOperationState{Phase: "Running"},
+		},
+	}
+	idx := reconcileIndexForTest(map[string][]application{secretName: {app}}, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 0 {
+		t.Fatalf("expected no pause while a sync operation is running, got %v", patches)
+	}
+}

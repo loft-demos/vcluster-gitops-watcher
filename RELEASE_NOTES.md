@@ -1,5 +1,18 @@
 # Release Notes
 
+## 2.1.3-rc.1
+
+One fix, completing the 2.1.2-rc.1 fix for tenant clusters paused before Argo CD finished with them.
+
+### Fixed: a destination re-paused mid rollout stayed Progressing forever
+
+2.1.2-rc.1 kept a destination un-paused until Argo CD had reconciled each Application once. One reconcile is often mid rollout: Argo CD records `Progressing` while a Deployment or DaemonSet comes up, and only a later reconcile moves it to `Healthy`. The watcher then saw no sync intent and no `OutOfSync` revision, re-paused the destination as idle, and the Application stayed `Progressing` with its last health message (for example `Waiting for daemon set ... rollout to finish`) long after every pod was ready. Stack tasks waiting for `Healthy` timed out.
+
+- An Application whose health is `Progressing`, or whose sync operation is still `Running`, now counts as work for a ready destination and for one in an unknown state, alongside never-reconciled Applications. The watcher logs `removed ... : applications <names> are still rolling out` when that is why it un-pauses.
+- `Progressing` health that the watcher itself patched while the vCluster was waking (the `wakingHealthMessage`) does not count.
+- As before, none of this wakes a sleeping VCI, and a destination is re-paused once its Applications are `Healthy` (or `Degraded`, `Suspended` and so on) with no operation running.
+- To recover a destination stuck by this bug, upgrade. The watcher un-pauses it on its next poll, Argo CD reconciles, and the Application moves on from `Progressing`.
+
 ## 2.1.2-rc.1
 
 One fix, for tenant clusters that register with Argo CD before their first reconcile.
