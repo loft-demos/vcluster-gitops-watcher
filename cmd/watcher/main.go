@@ -177,6 +177,7 @@ type watcherRuntime struct {
 	sleepAfterSync           map[string]*sleepAfterSyncState
 	invalidWakeLogged        map[string]bool
 	pauseDisabledLogged      map[string]bool
+	unmanagedLogged          map[string]string
 	kargoPromotionsChecked   bool
 	kargoPromotionsAvailable bool
 }
@@ -196,17 +197,35 @@ type condition struct {
 	Message string `json:"message"`
 }
 
+// vciHelmRelease carries the vcluster.yaml values the watcher reads to tell
+// whether a tenant cluster can sleep at all.
+type vciHelmRelease struct {
+	Values string `json:"values"`
+}
+
+type vciTemplate struct {
+	HelmRelease vciHelmRelease `json:"helmRelease"`
+}
+
+type virtualClusterSpec struct {
+	Template *vciTemplate `json:"template,omitempty"`
+}
+
 type virtualClusterStatus struct {
 	Phase           string              `json:"phase"`
 	SleepModeConfig *vciSleepModeConfig `json:"sleepModeConfig,omitempty"`
-	Reason          string              `json:"reason"`
-	Message         string              `json:"message"`
-	Online          *bool               `json:"online"`
-	Conditions      []condition         `json:"conditions"`
+	// VirtualCluster is the resolved template; for a templated VCI it is the
+	// only place its vcluster.yaml values appear.
+	VirtualCluster *vciTemplate `json:"virtualCluster,omitempty"`
+	Reason         string       `json:"reason"`
+	Message        string       `json:"message"`
+	Online         *bool        `json:"online"`
+	Conditions     []condition  `json:"conditions"`
 }
 
 type virtualClusterInstance struct {
 	Metadata metadata             `json:"metadata"`
+	Spec     virtualClusterSpec   `json:"spec"`
 	Status   virtualClusterStatus `json:"status"`
 }
 
@@ -478,9 +497,16 @@ func (index *clusterSecretIndex) resolveQuery(q clusterSecretQuery) resolvedClus
 		return resolved
 	}
 
+	// A Secret whose platform labels name another VCI belongs to that VCI, so
+	// no name or server heuristic below may hand it to this one.
+	labeledForOther := func(s *secret) bool {
+		key := secretInstanceKey(s)
+		return key != "" && q.instanceKey != "" && key != q.instanceKey
+	}
+
 	// 1. exact data.name match (covers v1, Akuity v2, and plain Argo CD v2).
 	for _, name := range q.expectedNames {
-		if s, ok := index.bySecretDataName[name]; ok {
+		if s, ok := index.bySecretDataName[name]; ok && !labeledForOther(s) {
 			return matched(s)
 		}
 	}
@@ -504,7 +530,7 @@ func (index *clusterSecretIndex) resolveQuery(q clusterSecretQuery) resolvedClus
 		if normalized == "" {
 			continue
 		}
-		if s, ok := index.byServer[normalized]; ok {
+		if s, ok := index.byServer[normalized]; ok && !labeledForOther(s) {
 			result := matched(s)
 			result.server = normalized
 			return result
@@ -513,11 +539,16 @@ func (index *clusterSecretIndex) resolveQuery(q clusterSecretQuery) resolvedClus
 
 	// 4. fallback for names the platform extended with the instance-ID hash or
 	//    truncated with SafeConcatNameMax(..., clusterNameMaxLength).
+	_, vciName, _ := strings.Cut(q.instanceKey, "/")
 	var candidates []*secret
 	for _, s := range filterSecretsByHost(index.ordered, q.platformHost) {
+		if labeledForOther(s) {
+			continue
+		}
 		dataName := s.dataName()
+		unlabeled := secretInstanceKey(s) == ""
 		for _, name := range q.expectedNames {
-			if clusterNameFallbackMatch(name, dataName) {
+			if clusterNameFallbackMatch(name, dataName) || (unlabeled && legacyPrefixMatch(name, dataName, vciName)) {
 				candidates = append(candidates, s)
 				break
 			}
@@ -539,6 +570,10 @@ func (index *clusterSecretIndex) resolveQuery(q clusterSecretQuery) resolvedClus
 // clusterNameFallbackMatch reports whether dataName is expected with the
 // platform's instance-ID hash appended, or is the truncated form of a name
 // that, with the hash, would exceed clusterNameMaxLength.
+// clusterNameFallbackMatch reports whether dataName is a name the platform
+// derives from expected: expected plus the instance-ID hash, or expected
+// truncated by SafeConcatNameMax, which is computed exactly rather than guessed
+// from a shared prefix.
 func clusterNameFallbackMatch(expected, dataName string) bool {
 	if expected == "" || dataName == "" || len(dataName) > clusterNameMaxLength {
 		return false
@@ -551,7 +586,34 @@ func clusterNameFallbackMatch(expected, dataName string) bool {
 		suffix, ok := strings.CutPrefix(dataName, expected+"-")
 		return ok && isLowerHex(suffix, instanceIDHashLength)
 	}
-	return strings.HasPrefix(dataName, expected[:clusterNamePrefixMatchLength])
+	return dataName == safeConcatNameMax(expected, clusterNameMaxLength)
+}
+
+// legacyPrefixMatch is the old shared-prefix fallback for a truncated name the
+// exact match cannot reproduce. Callers use it only for Secrets with no platform
+// instance labels. It also requires the whole VCI name, and the separator after
+// it, inside the compared prefix: otherwise VCIs whose names share the first
+// characters (nv-gpu-opera-test, nv-gpu-operator-test), or every VCI in a
+// project with a long name, would match each other's Secret.
+func legacyPrefixMatch(expected, dataName, vciName string) bool {
+	if expected == "" || dataName == "" || vciName == "" || len(dataName) > clusterNameMaxLength ||
+		len(expected) <= clusterNamePrefixMatchLength {
+		return false
+	}
+	prefix := expected[:clusterNamePrefixMatchLength]
+	if !strings.Contains(prefix, "-"+vciName+"-") {
+		return false
+	}
+	return strings.HasPrefix(dataName, prefix)
+}
+
+// secretInstanceKey is the namespace/name of the VCI a cluster Secret's
+// platform labels name, or "" when it carries none.
+func secretInstanceKey(s *secret) string {
+	if s == nil {
+		return ""
+	}
+	return instanceKey(s.Metadata.Labels[vciNamespaceLabel], s.Metadata.Labels[vciNameLabel])
 }
 
 func isLowerHex(value string, length int) bool {
@@ -1216,6 +1278,7 @@ func newWatcherRuntime() *watcherRuntime {
 		sleepAfterSync:          map[string]*sleepAfterSyncState{},
 		invalidWakeLogged:       map[string]bool{},
 		pauseDisabledLogged:     map[string]bool{},
+		unmanagedLogged:         map[string]string{},
 	}
 }
 
@@ -2165,9 +2228,13 @@ func wakeRetryDue(runtime *watcherRuntime, clusterSecretName string, retryInterv
 		return true
 	}
 
+	// Retry only a wake this watcher attempted and that has not reached Ready
+	// since: the Ready branch forgets the attempt. Without that, a signal the
+	// watcher already acted on (an Application that stays OutOfSync, say)
+	// woke the VCI again every time it fell back asleep.
 	lastAttempt, ok := runtime.lastWakeAttempt[clusterSecretName]
 	if !ok || lastAttempt.IsZero() {
-		return true
+		return false
 	}
 
 	return now.Sub(lastAttempt) >= retryInterval
@@ -2479,6 +2546,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	healthPatchEnabled := cfg.patchApplicationHealth && !apiOnly
 
 	secretPaused := pauseEnabled && strings.TrimSpace(clusterSecret.Metadata.Annotations[argocdSkipReconcileAnnotation]) == "true"
+
+	if reason := vciUnmanagedReason(cfg, vci); reason != "" {
+		return leaveUnmanagedVCI(ctx, cfg, runtime, vci, runtimeKey, reason, pauseEnabled && secretPaused, secretMetaName)
+	}
+	delete(runtime.unmanagedLogged, runtimeKey)
+
 	state := classifyVCI(vci, secretPaused)
 	syncIntentApps := applicationsWithSyncIntent(apps)
 	newSyncIntentApps := newSyncIntentApplications(syncIntentApps, runtime.observedSyncIntents)
@@ -2630,7 +2703,20 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		needsReadyRefresh := applicationsNeedReadyRefresh(apps, *cfg)
 		needsOneTimeReadyRefresh := needsReadyRefresh && !runtime.observedReadyRefreshes[runtimeKey]
-		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh || pendingReconcile
+		// A refresh Argo CD has not processed yet: a new one (a UI or webhook
+		// refresh on an awake but paused cluster), or the one that made the
+		// watcher wake this VCI (still recorded in lastWakeAttempt until this
+		// pass ends). Argo CD can only act on it while un-paused, so it opens the
+		// refresh grace below. A zero grace keeps the old behavior.
+		_, wokeByWatcher := runtime.lastWakeAttempt[runtimeKey]
+		refreshNeedsReconcile := cfg.readyRefreshGrace > 0 &&
+			(len(newRefreshRequestApps) > 0 || (wokeByWatcher && len(refreshRequestApps) > 0))
+		if refreshNeedsReconcile {
+			if _, ok := runtime.readyUnpausedAt[runtimeKey]; !ok {
+				runtime.readyUnpausedAt[runtimeKey] = time.Now()
+			}
+		}
+		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh || pendingReconcile || refreshNeedsReconcile
 		// Refresh annotations are edge-triggered wake signals, not persistent
 		// work: a stale one must not keep the destination un-paused forever.
 		// But right after the watcher un-pauses, a pending refresh (its own
@@ -2650,13 +2736,17 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, false); err != nil {
 				return fmt.Errorf("resume cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretMetaName, err)
 			}
-			if !hasActiveWork && !needsOneTimeReadyRefresh && len(awaitingFirstReconcileApps) > 0 {
-				log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s: applications %s have never been reconciled", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name, strings.Join(applicationNames(awaitingFirstReconcileApps), ", "))
-			} else if !hasActiveWork && !needsOneTimeReadyRefresh {
-				log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s: applications %s are still rolling out", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name, strings.Join(applicationNames(rollingOutApps), ", "))
-			} else {
-				log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
+			reason := ""
+			switch {
+			case hasActiveWork || needsOneTimeReadyRefresh:
+			case len(awaitingFirstReconcileApps) > 0:
+				reason = ": applications " + strings.Join(applicationNames(awaitingFirstReconcileApps), ", ") + " have never been reconciled"
+			case len(rollingOutApps) > 0:
+				reason = ": applications " + strings.Join(applicationNames(rollingOutApps), ", ") + " are still rolling out"
+			case refreshNeedsReconcile:
+				reason = ": applications " + strings.Join(applicationNames(refreshRequestApps), ", ") + " have a refresh pending"
 			}
+			log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name, reason)
 			secretPaused = false
 			runtime.readyUnpausedAt[runtimeKey] = time.Now()
 		}

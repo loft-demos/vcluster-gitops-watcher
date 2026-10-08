@@ -10,7 +10,7 @@ can also install the optional `vcluster-wakeup-proxy`.
 ```bash
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.1.3-rc.1 \
+  --version 2.1.4-rc.1 \
   --namespace argocd
 ```
 
@@ -41,7 +41,7 @@ kubectl -n argocd create secret generic vcluster-platform-token \
 
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.1.3-rc.1 \
+  --version 2.1.4-rc.1 \
   --namespace argocd \
   --set watcher.platformHost=platform.example.com \
   --set watcher.wake.upstreamBase=https://platform.example.com \

@@ -178,6 +178,20 @@ Only wake requests change. A VCI the watcher does not wake is still paused with 
 
 An invalid value, anything other than `"true"`, `"false"`, or `"sync"`, is logged once and the global mode applies. Use a VirtualClusterInstance template's `metadata.annotations` to set the annotation on every VCI created from that template.
 
+### VCIs the Watcher Leaves Alone
+
+A tenant cluster with private nodes cannot sleep, so the watcher has nothing to save by pausing Argo CD for it, and a pause can only hold up work Argo CD has to finish. The watcher detects `privateNodes.enabled: true` in the VCI's vcluster.yaml (`status.virtualCluster.helmRelease.values` for a VCI created from a template, `spec.template.helmRelease.values` otherwise) and leaves that VCI alone: it never pauses it, never patches its applications' health, and never wakes or re-sleeps it. If an earlier watcher version left `skip-reconcile` on its cluster Secret, the watcher removes it once and logs why.
+
+Override the detection per VCI with the `gitops-watcher.loft-demos.github.io/manage` annotation:
+
+| Annotation value | Effect |
+| --- | --- |
+| `"false"` | The watcher leaves the VCI alone, whether or not it uses private nodes |
+| `"true"` | The watcher manages the VCI even if it uses private nodes |
+| absent | Private-nodes VCIs are left alone, all others are managed |
+
+The watcher logs `not managing VCI <namespace>/<name>: <reason>` once when it starts leaving a VCI alone.
+
 ### Sleep After Sync
 
 vCluster Platform deliberately never lets Argo CD wake a sleeping tenant cluster, because most teams are happy for a new deploy to wait until the tenant cluster wakes for another reason. `sync` mode is a middle ground: the deploy lands right away, but the tenant cluster only stays awake as long as the deploy needs.

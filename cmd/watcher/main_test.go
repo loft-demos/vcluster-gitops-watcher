@@ -2034,8 +2034,8 @@ func TestClusterSecretIndexResolvesViaTruncatedPrefix(t *testing.T) {
 	if len(full) <= clusterNameMaxLength {
 		t.Fatalf("test setup expected a name longer than %d, got %d", clusterNameMaxLength, len(full))
 	}
-	// Simulate the platform's SafeConcatNameMax truncation with a hash suffix.
-	truncated := full[:clusterNamePrefixMatchLength] + "-9f2a1"
+	// The platform's SafeConcatNameMax truncation, computed exactly.
+	truncated := safeConcatNameMax(full, clusterNameMaxLength)
 
 	index := buildClusterSecretIndex([]secret{v2ClusterSecret("cluster-host-trunc", truncated, "https://x")})
 

@@ -1,5 +1,35 @@
 # Release Notes
 
+## 2.1.4-rc.1
+
+The watcher now leaves tenant clusters with private nodes alone, and three fixes found in a review: a VCI could take another VCI's cluster Secret, an Application that stayed OutOfSync woke its VCI every time it fell asleep, and a refresh on an awake but paused cluster never reached Argo CD.
+
+### New: tenant clusters with private nodes are left alone
+
+A tenant cluster with private nodes cannot sleep, so pausing Argo CD for it saves nothing, and both deadlocks fixed in 2.1.2-rc.1 and 2.1.3-rc.1 hit private-nodes clusters. The watcher now reads `privateNodes.enabled` from the VCI's vcluster.yaml (`status.virtualCluster.helmRelease.values` for a templated VCI, `spec.template.helmRelease.values` otherwise) and does nothing for such a VCI: no pause, no health patching, no wake, no sleep after sync.
+
+- If an earlier version left `skip-reconcile` on the cluster Secret of such a VCI, the watcher removes it once and logs `removed ... : VCI <ns>/<name> is not managed (...)`.
+- The new `gitops-watcher.loft-demos.github.io/manage` annotation overrides the detection: `"false"` opts any VCI out, `"true"` keeps a private-nodes VCI managed.
+
+### Fixed: a VCI could match another VCI's cluster Secret
+
+When a VCI's own cluster Secret was missing, for example in the seconds between creating the tenant cluster and its Argo CD registration, the last-resort name match accepted any Secret whose name shared its first 40 characters. Two VCIs with similar names (`nv-gpu-opera-test` and `nv-gpu-operator-test`), or any two VCIs in a project whose name is 19 characters or longer, matched each other's Secret. The watcher then paused, un-paused, woke, or patched the health of the wrong cluster.
+
+- A Secret whose `loft.sh/vcluster-instance-*` labels name another VCI is never matched to this one, at any step.
+- A truncated name now matches only the exact name the platform's `SafeConcatNameMax` produces from this VCI's expected name. The old shared-prefix match remains only for Secrets without instance labels, and only when the VCI's whole name falls inside the compared prefix.
+
+### Fixed: an Application that stays OutOfSync woke its VCI after every sleep
+
+An Application that never got back in sync (manual sync, a failing sync, drift Argo CD keeps reporting) counted as wake work again each time its VCI fell asleep, because the wake retry treated "never tried" as "due". The VCI was woken, went back to sleep, and was woken again.
+
+- A wake is now retried only if the watcher attempted it and the VCI has not reached Ready since. A new OutOfSync revision still wakes the VCI as before.
+
+### Fixed: a refresh on an awake but paused cluster never reached Argo CD
+
+A refresh requested on a ready VCI the watcher had paused as idle (a UI refresh, a Git webhook, or the refresh that made the watcher wake it when application health patching is off) stayed pending behind `skip-reconcile`.
+
+- A new refresh request, or the one the VCI was woken for, now un-pauses a ready destination for the existing `WATCH_READY_REFRESH_GRACE` window, logging `removed ... : applications <names> have a refresh pending`. With the grace set to `0` the behavior is unchanged.
+
 ## 2.1.3-rc.1
 
 One fix, completing the 2.1.2-rc.1 fix for tenant clusters paused before Argo CD finished with them.
@@ -41,7 +71,7 @@ When something set `argocd.argoproj.io/refresh` on an Application for a sleeping
 
 The chart sets `runAsNonRoot: true`, but the watcher and proxy images ran as the distroless user named `nonroot`. Kubernetes can only verify `runAsNonRoot` against a numeric user, so with the chart defaults the pod never started:
 
-```
+```log
 container has runAsNonRoot and image has non-numeric user (nonroot), cannot verify user is non-root
 ```
 
@@ -49,7 +79,6 @@ container has runAsNonRoot and image has non-numeric user (nonroot), cannot veri
 - Both images now declare `USER 65532:65532`, so `runAsNonRoot` also works outside the chart.
 
 No configuration changes are needed. If you worked around this by setting `podSecurityContext.runAsUser` / `runAsGroup` yourself, you can remove those values.
-
 
 ## 2.1.0-rc.1
 
