@@ -1,6 +1,8 @@
 # Release Notes
 
-## Unreleased
+## 2.1.2-rc.1
+
+One fix, for tenant clusters that register with Argo CD before their first reconcile.
 
 ### Fixed: a new tenant cluster could stay paused before its first Argo CD reconcile
 
