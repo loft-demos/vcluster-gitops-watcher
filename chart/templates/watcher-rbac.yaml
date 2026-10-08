@@ -14,6 +14,11 @@ rules:
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
     verbs: ["get", "list", "watch"]
+  # Refresh and sync requests vCluster Platform is waiting on Argo CD for
+  # (Stack task retries, the Platform UI's Refresh and Sync buttons).
+  - apiGroups: ["management.loft.sh"]
+    resources: ["argocdapplications"]
+    verbs: ["get", "list"]
   {{- if or .Values.watcher.wake.upstreamBase (and .Values.watcher.wake.useProxy .Values.proxy.enabled) }}
   # Sleep after sync sets sleepmode.loft.sh/force on a VCI once its deploy is
   # done. Any VCI can opt in with the wake annotation, so this is not limited
@@ -22,9 +27,11 @@ rules:
     resources: ["virtualclusterinstances"]
     verbs: ["patch"]
   {{- end }}
-  {{- if .Values.watcher.wake.updateVCILastActivity }}
+  {{- if and .Values.watcher.wake.updateVCILastActivity (not (or .Values.watcher.wake.upstreamBase (and .Values.watcher.wake.useProxy .Values.proxy.enabled))) }}
+  # Activity is recorded with the sleepmode.loft.sh/last-activity annotations;
+  # VCIs have no status subresource. Already granted above when wakes are on.
   - apiGroups: ["management.loft.sh"]
-    resources: ["virtualclusterinstances/status"]
+    resources: ["virtualclusterinstances"]
     verbs: ["patch"]
   {{- end }}
   {{- $accessKey := .Values.watcher.wake.accessKey }}

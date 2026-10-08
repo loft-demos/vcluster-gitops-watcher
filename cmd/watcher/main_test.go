@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -109,30 +110,39 @@ func TestClassifyVCISleepingWhenSleepAnnotationsArePresent(t *testing.T) {
 	}
 }
 
-func TestClassifyVCIReadyWhenOnlineConditionIsTrue(t *testing.T) {
+// status.online and VirtualClusterOnline only say a network peer exists; they are
+// not readiness. Platform's own signal is phase Ready.
+func TestClassifyVCIOnlineAloneIsNotReady(t *testing.T) {
+	online := true
 	vci := virtualClusterInstance{
 		Status: virtualClusterStatus{
+			Phase:      "Pending",
+			Reason:     "PodNotReady",
+			Online:     &online,
+			Conditions: []condition{{Type: virtualClusterOnlineConditionType, Status: "True"}},
+		},
+	}
+
+	if got := classifyVCI(vci, false); got != vciStateUnknown {
+		t.Fatalf("expected Unknown, got %s", got)
+	}
+}
+
+// A new VCI is Pending for reasons other than sleep: it is not waking, so the
+// watcher must not pause it or report "vCluster waking" on its applications.
+func TestClassifyVCINewPendingVCIIsNotWaking(t *testing.T) {
+	vci := virtualClusterInstance{
+		Status: virtualClusterStatus{
+			Phase:  "Pending",
+			Reason: "VirtualClusterNotReady",
 			Conditions: []condition{
-				{Type: virtualClusterOnlineConditionType, Status: "True"},
+				{Type: virtualClusterReadyConditionType, Status: "False", Reason: "VirtualClusterNotReady"},
 			},
 		},
 	}
 
-	if got := classifyVCI(vci, true); got != vciStateReady {
-		t.Fatalf("expected Ready, got %s", got)
-	}
-}
-
-func TestClassifyVCIReadyWhenStatusOnlineIsTrue(t *testing.T) {
-	online := true
-	vci := virtualClusterInstance{
-		Status: virtualClusterStatus{
-			Online: &online,
-		},
-	}
-
-	if got := classifyVCI(vci, false); got != vciStateReady {
-		t.Fatalf("expected Ready, got %s", got)
+	if got := classifyVCI(vci, false); got != vciStateUnknown {
+		t.Fatalf("expected Unknown, got %s", got)
 	}
 }
 
@@ -182,48 +192,30 @@ func TestClassifyVCIReadyForObservedAwakeShape(t *testing.T) {
 	}
 }
 
-func TestClassifyVCISleepingWhenVirtualClusterReadyConditionSaysSleeping(t *testing.T) {
+// The wake window as Platform reports it: sleeping-since is gone, the phase is
+// Pending, and VirtualClusterReady keeps reason Sleeping until the API answers.
+// The old "sleep" substring heuristic read this as Sleeping for the whole wake.
+func TestClassifyVCIWakingWhileVirtualClusterReadyStillSaysSleeping(t *testing.T) {
 	vci := virtualClusterInstance{
 		Status: virtualClusterStatus{
+			Phase:   "Pending",
+			Reason:  "Sleeping",
+			Message: "Virtual Cluster is sleeping",
 			Conditions: []condition{
-				{
-					Type:    readyConditionType,
-					Status:  "False",
-					Reason:  "Sleeping",
-					Message: "Virtual Cluster is sleeping",
-				},
-				{
-					Type:    virtualClusterOnlineConditionType,
-					Status:  "False",
-					Reason:  "NetworkPeerOffline",
-					Message: "vCluster seems to be offline",
-				},
-				{
-					Type:    virtualClusterReadyConditionType,
-					Status:  "False",
-					Reason:  "Sleeping",
-					Message: "Virtual Cluster is sleeping",
-				},
+				{Type: readyConditionType, Status: "False", Reason: "Sleeping", Message: "Virtual Cluster is sleeping"},
+				{Type: virtualClusterOnlineConditionType, Status: "False", Reason: "NetworkPeerOffline", Message: "vCluster seems to be offline"},
+				{Type: virtualClusterReadyConditionType, Status: "False", Reason: "Sleeping", Message: "Virtual Cluster is sleeping"},
 			},
 		},
 	}
 
-	if got := classifyVCI(vci, false); got != vciStateSleeping {
-		t.Fatalf("expected Sleeping, got %s", got)
+	if got := classifyVCI(vci, false); got != vciStateWaking {
+		t.Fatalf("expected Waking, got %s", got)
 	}
 }
 
-func TestClassifyVCIWakingWhenPausedAndNotOtherwiseReadyOrSleeping(t *testing.T) {
-	vci := virtualClusterInstance{
-		Status: virtualClusterStatus{
-			Phase: "Starting",
-			Conditions: []condition{
-				{Type: virtualClusterOnlineConditionType, Status: "False"},
-			},
-		},
-	}
-
-	if got := classifyVCI(vci, true); got != vciStateWaking {
+func TestClassifyVCIWakingWhenPausedAndStatusNotWrittenYet(t *testing.T) {
+	if got := classifyVCI(virtualClusterInstance{}, true); got != vciStateWaking {
 		t.Fatalf("expected Waking, got %s", got)
 	}
 }
@@ -557,6 +549,13 @@ func TestLoadWatcherConfigBuildsWakeRequesterWhenConfigured(t *testing.T) {
 	}
 	if cfg.wakeRetryInterval != defaultWakeRetryInterval {
 		t.Fatalf("expected default wake retry interval %s, got %s", defaultWakeRetryInterval, cfg.wakeRetryInterval)
+	}
+	// Platform returns 502 when it skips a wake, so only 504 is accepted by default.
+	if _, ok := cfg.wakeRequester.acceptedStatuses[http.StatusGatewayTimeout]; !ok {
+		t.Fatal("expected 504 to be accepted by default")
+	}
+	if _, ok := cfg.wakeRequester.acceptedStatuses[http.StatusBadGateway]; ok {
+		t.Fatal("expected 502 not to be accepted by default")
 	}
 }
 
@@ -1602,7 +1601,7 @@ func TestReconcileVCIRetriesWakeAfterCooldownWhenOutOfSyncRevisionPersists(t *te
 
 func TestReconcileVCIUpdatesVCILastActivityOnWakeWhenEnabled(t *testing.T) {
 	const secretName = "loft-demo-vcluster-team-a"
-	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a/status"
+	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a"
 
 	var patchBodies []string
 	before := time.Now().Unix()
@@ -1685,19 +1684,20 @@ func TestReconcileVCIUpdatesVCILastActivityOnWakeWhenEnabled(t *testing.T) {
 	if err := json.Unmarshal([]byte(patchBodies[0]), &payload); err != nil {
 		t.Fatalf("unmarshal status patch: %v", err)
 	}
-	status, _ := payload["status"].(map[string]any)
-	sleepModeConfig, _ := status["sleepModeConfig"].(map[string]any)
-	sleepStatus, _ := sleepModeConfig["status"].(map[string]any)
-	lastActivity, _ := sleepStatus["lastActivity"].(float64)
+	// VCIs have no status subresource: activity is the annotation Platform reads.
+	meta, _ := payload["metadata"].(map[string]any)
+	annotations, _ := meta["annotations"].(map[string]any)
+	raw, _ := annotations[sleepModeLastActivityAnno].(string)
+	lastActivity, _ := strconv.ParseInt(raw, 10, 64)
 	after := time.Now().Unix()
-	if int64(lastActivity) < before || int64(lastActivity) > after {
+	if lastActivity < before || lastActivity > after {
 		t.Fatalf("expected lastActivity to be patched to a current timestamp between %d and %d, got %v", before, after, lastActivity)
 	}
 }
 
 func TestReconcileVCIIgnoresVCILastActivityPatchFailure(t *testing.T) {
 	const secretName = "loft-demo-vcluster-team-a"
-	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a/status"
+	const vciStatusPath = "/apis/management.loft.sh/v1/namespaces/p-demo/virtualclusterinstances/team-a"
 
 	patchCalls := 0
 	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

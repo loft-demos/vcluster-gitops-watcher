@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/signal"
 	"sort"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +27,10 @@ const (
 	argocdClusterRefreshAnnotation = "argocd.argoproj.io/refresh"
 	argocdSkipReconcileAnnotation  = "argocd.argoproj.io/skip-reconcile"
 	kargoAuthorizedStageAnnotation = "kargo.akuity.io/authorized-stage"
+	// loftManagedByLabel with platformArgoCDManagedByValue marks Applications
+	// vCluster Platform's ArgoCDApplication controller created.
+	loftManagedByLabel           = "loft.sh/managed-by"
+	platformArgoCDManagedByValue = "argocdapplication-controller"
 
 	loftProjectLabel = "loft.sh/project"
 	// registeredClusterNameAnnotation is written on the VirtualClusterInstance
@@ -83,6 +88,13 @@ const (
 	// loft-default-virtualcluster-llm-large-argocd. Each expanded template is
 	// also tried with this suffix.
 	argocdClusterNameSuffix = "-argocd"
+
+	// sleepingReason is the reason Platform puts on VirtualClusterReady (and
+	// copies to status.reason) while a VCI sleeps and until it is up again.
+	sleepingReason = "Sleeping"
+
+	// wakeUserAgent identifies the watcher's wake requests.
+	wakeUserAgent = "vcluster-gitops-watcher"
 )
 
 // clusterNameSuffixes are the suffix variants tried for every expanded template,
@@ -168,18 +180,24 @@ type watcherRuntime struct {
 	observedReadyRefreshes  map[string]bool
 	// readyUnpausedAt records when the watcher last un-paused a ready
 	// destination, to bound how long a pending refresh keeps it un-paused.
-	readyUnpausedAt          map[string]time.Time
-	lastWakeAttempt          map[string]time.Time
-	lastKnownKargoHealth     map[string]healthStatus
-	prefixMatchLogged        map[string]bool
-	ambiguousMatchLogged     map[string]bool
-	wakeSuppressedLogged     map[string]bool
-	sleepAfterSync           map[string]*sleepAfterSyncState
-	invalidWakeLogged        map[string]bool
-	pauseDisabledLogged      map[string]bool
-	unmanagedLogged          map[string]string
-	kargoPromotionsChecked   bool
-	kargoPromotionsAvailable bool
+	readyUnpausedAt      map[string]time.Time
+	lastWakeAttempt      map[string]time.Time
+	lastKnownKargoHealth map[string]healthStatus
+	prefixMatchLogged    map[string]bool
+	ambiguousMatchLogged map[string]bool
+	wakeSuppressedLogged map[string]bool
+	sleepAfterSync       map[string]*sleepAfterSyncState
+	invalidWakeLogged    map[string]bool
+	pauseDisabledLogged  map[string]bool
+	unmanagedLogged      map[string]string
+	unwakeableLogged     map[string]string
+	// observedPlatformWork is, per cluster, the vCluster Platform requests the
+	// watcher has already acted on (see platformwork.go).
+	observedPlatformWork          map[string]map[string]string
+	platformAppsRecheckAt         time.Time
+	platformAppsUnavailableLogged bool
+	kargoPromotionsChecked        bool
+	kargoPromotionsAvailable      bool
 }
 
 type metadata struct {
@@ -207,8 +225,19 @@ type vciTemplate struct {
 	HelmRelease vciHelmRelease `json:"helmRelease"`
 }
 
+// vciClusterRef is where a VCI runs; empty for an external VCI that is not
+// connected to a cluster.
+type vciClusterRef struct {
+	Cluster        string `json:"cluster,omitempty"`
+	Namespace      string `json:"namespace,omitempty"`
+	VirtualCluster string `json:"virtualCluster,omitempty"`
+}
+
 type virtualClusterSpec struct {
-	Template *vciTemplate `json:"template,omitempty"`
+	Template   *vciTemplate  `json:"template,omitempty"`
+	Standalone bool          `json:"standalone,omitempty"`
+	External   bool          `json:"external,omitempty"`
+	ClusterRef vciClusterRef `json:"clusterRef,omitempty"`
 }
 
 type virtualClusterStatus struct {
@@ -872,10 +901,14 @@ func newWakeRequesterFromEnv() (*wakeRequester, error) {
 	}
 
 	return &wakeRequester{
-		client:           client,
-		baseURL:          baseURL,
-		bearerToken:      bearerToken,
-		acceptedStatuses: parseStatusSet(mustEnv("WATCH_WAKE_SUCCESS_ON", "502,504")),
+		client:      client,
+		baseURL:     baseURL,
+		bearerToken: bearerToken,
+		// 504 only: Platform holds a wake request until the VCI is ready, so a
+		// gateway timeout means the wake started. A 502 is what Platform returns
+		// when it skips the wake (an ignore-activity identity or user agent,
+		// forced-duration sleep), so it is not a success.
+		acceptedStatuses: parseStatusSet(mustEnv("WATCH_WAKE_SUCCESS_ON", "504")),
 	}, nil
 }
 
@@ -1251,6 +1284,10 @@ func (w *wakeRequester) post(ctx context.Context, targetURL, namespace, virtualC
 		return nil, fmt.Errorf("build wake request: %w", err)
 	}
 	req.Header.Set("Accept", "application/json")
+	// A distinctive User-Agent lets operators recognise the watcher's wakes in
+	// Platform logs and keep it out of sleep-mode ignore-user-agents rules,
+	// which would make Platform skip the wake.
+	req.Header.Set("User-Agent", wakeUserAgent)
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
@@ -1279,6 +1316,8 @@ func newWatcherRuntime() *watcherRuntime {
 		invalidWakeLogged:       map[string]bool{},
 		pauseDisabledLogged:     map[string]bool{},
 		unmanagedLogged:         map[string]string{},
+		unwakeableLogged:        map[string]string{},
+		observedPlatformWork:    map[string]map[string]string{},
 	}
 }
 
@@ -1748,15 +1787,21 @@ func (a *kubernetesAPI) patchApplicationHealthOnResource(ctx context.Context, na
 	})
 }
 
-func (a *kubernetesAPI) patchVirtualClusterInstanceLastActivityStatus(ctx context.Context, namespace, name string, lastActivity int64) error {
-	return a.mergePatch(ctx, "/apis/management.loft.sh/v1/namespaces/"+url.PathEscape(namespace)+"/virtualclusterinstances/"+url.PathEscape(name)+"/status", map[string]any{
-		"status": map[string]any{
-			"sleepModeConfig": map[string]any{
-				"status": map[string]any{
-					"lastActivity": lastActivity,
-				},
-			},
-		},
+// patchVirtualClusterInstanceActivity records activity on a VCI the way
+// `vcluster platform wakeup` does: the sleepmode.loft.sh/last-activity
+// annotation, plus last-activity-info naming the subject so sync mode can tell
+// the watcher's own activity from a user's. VCIs have no status subresource.
+func (a *kubernetesAPI) patchVirtualClusterInstanceActivity(ctx context.Context, namespace, name string, at int64, subject string) error {
+	annotations := map[string]any{sleepModeLastActivityAnno: strconv.FormatInt(at, 10)}
+	if subject != "" {
+		info, err := json.Marshal(map[string]string{"subject": subject})
+		if err != nil {
+			return err
+		}
+		annotations[sleepModeLastActivityInfoAnno] = string(info)
+	}
+	return a.mergePatch(ctx, "/apis/management.loft.sh/v1/namespaces/"+url.PathEscape(namespace)+"/virtualclusterinstances/"+url.PathEscape(name), map[string]any{
+		"metadata": map[string]any{"annotations": annotations},
 	})
 }
 
@@ -1875,62 +1920,46 @@ func findCondition(conditions []condition, conditionType string) (condition, boo
 	return condition{}, false
 }
 
-func containsSleepHint(values ...string) bool {
-	for _, value := range values {
-		if strings.Contains(strings.ToLower(strings.TrimSpace(value)), "sleep") {
-			return true
-		}
-	}
-	return false
-}
-
+// classifyVCI maps a VCI to the watcher's states from the signals vCluster
+// Platform itself derives them from:
+//   - Sleeping: the sleepmode.loft.sh/sleeping-since (or sleep-type) annotation;
+//     Platform sets phase Sleeping from exactly that annotation.
+//   - Waking: the annotation is gone but the control plane is not up yet:
+//     phase Pending with reason Sleeping (Platform keeps VirtualClusterReady at
+//     reason Sleeping until the tenant cluster API answers).
+//   - Ready: phase Ready, which Platform sets only once VirtualClusterReady is
+//     True.
+//
+// status.online and the VirtualClusterOnline condition are not used: online
+// only means a network peer exists. A Pending VCI that is not coming out of
+// sleep (a new one, say) is Unknown, not Waking.
 func classifyVCI(vci virtualClusterInstance, secretPaused bool) vciState {
-	if hasSleepAnnotation(vci.Metadata.Annotations) {
+	if hasSleepAnnotation(vci.Metadata.Annotations) || strings.EqualFold(vci.Status.Phase, "Sleeping") {
 		return vciStateSleeping
 	}
 
-	onlineCondition, hasOnlineCondition := findCondition(vci.Status.Conditions, virtualClusterOnlineConditionType)
-	if strings.EqualFold(vci.Status.Phase, "Ready") ||
-		(vci.Status.Online != nil && *vci.Status.Online) ||
-		(hasOnlineCondition && strings.EqualFold(onlineCondition.Status, "True")) {
+	switch {
+	case strings.EqualFold(vci.Status.Phase, "Ready"):
 		return vciStateReady
-	}
-
-	sleepConditions := []string{
-		virtualClusterOnlineConditionType,
-		readyConditionType,
-		virtualClusterReadyConditionType,
-	}
-	for _, conditionType := range sleepConditions {
-		cond, ok := findCondition(vci.Status.Conditions, conditionType)
-		if !ok {
-			continue
-		}
-		if strings.EqualFold(cond.Status, "True") {
-			continue
-		}
-		if containsSleepHint(cond.Reason, cond.Message) {
-			return vciStateSleeping
-		}
-	}
-
-	if containsSleepHint(
-		vci.Status.Phase,
-		vci.Status.Reason,
-		vci.Status.Message,
-		onlineCondition.Reason,
-		onlineCondition.Message,
-	) {
-		if !hasOnlineCondition || !strings.EqualFold(onlineCondition.Status, "True") {
-			return vciStateSleeping
-		}
-	}
-
-	if secretPaused {
+	case strings.EqualFold(vci.Status.Phase, "Pending") && vciComingOutOfSleep(vci):
+		return vciStateWaking
+	case strings.TrimSpace(vci.Status.Phase) == "" && secretPaused:
+		// No status yet, but the watcher paused it earlier: keep treating it as
+		// waking rather than unknown.
 		return vciStateWaking
 	}
 
 	return vciStateUnknown
+}
+
+// vciComingOutOfSleep reports whether Platform still reports the sleep as the
+// reason the VCI is not ready.
+func vciComingOutOfSleep(vci virtualClusterInstance) bool {
+	if strings.EqualFold(strings.TrimSpace(vci.Status.Reason), sleepingReason) {
+		return true
+	}
+	cond, ok := findCondition(vci.Status.Conditions, virtualClusterReadyConditionType)
+	return ok && !strings.EqualFold(cond.Status, "True") && strings.EqualFold(strings.TrimSpace(cond.Reason), sleepingReason)
 }
 
 func applicationHasManagedHealth(app application, cfg watcherConfig) bool {
@@ -1940,6 +1969,22 @@ func applicationHasManagedHealth(app application, cfg watcherConfig) bool {
 	}
 
 	return message == cfg.sleepingHealthMessage || message == cfg.wakingHealthMessage
+}
+
+// applicationKeepsRealHealth reports whether something outside Argo CD reads this
+// Application's health status as a verdict, so the watcher must never replace it
+// with Suspended or Progressing: Kargo verification, and vCluster Platform, whose
+// Stack tasks count only Healthy+Synced as ready and time out on anything else.
+// For these the watcher keeps the last real status and changes only the message.
+func applicationKeepsRealHealth(app application) bool {
+	return applicationIsKargoManaged(app) || applicationIsPlatformManaged(app)
+}
+
+// applicationIsPlatformManaged reports whether vCluster Platform's
+// ArgoCDApplication controller created the Application (Stack tasks, Fleet
+// Observability and the Platform UI).
+func applicationIsPlatformManaged(app application) bool {
+	return strings.TrimSpace(app.Metadata.Labels[loftManagedByLabel]) == platformArgoCDManagedByValue
 }
 
 func applicationIsKargoManaged(app application) bool {
@@ -2318,7 +2363,7 @@ func patchApplicationHealthValue(ctx context.Context, cfg *watcherConfig, app ap
 func patchApplicationsHealth(ctx context.Context, cfg *watcherConfig, apps []application, status, message string) error {
 	desired := healthStatus{Status: status, Message: message}
 	for _, app := range apps {
-		if applicationIsKargoManaged(app) {
+		if applicationKeepsRealHealth(app) {
 			continue
 		}
 		if err := patchApplicationHealthValue(ctx, cfg, app, desired); err != nil {
@@ -2335,7 +2380,7 @@ func rememberKargoApplicationsHealth(runtime *watcherRuntime, apps []application
 	}
 
 	for _, app := range apps {
-		if !applicationIsKargoManaged(app) {
+		if !applicationKeepsRealHealth(app) {
 			continue
 		}
 		if applicationHasManagedHealth(app, cfg) {
@@ -2359,7 +2404,11 @@ func desiredKargoApplicationHealth(runtime *watcherRuntime, app application, cfg
 		}
 	}
 
-	if applicationHasManagedHealth(app, cfg) && app.Status.Health.Status == "Healthy" {
+	// The watcher wrote this status itself (Suspended or Progressing from an
+	// older version, or Healthy before a restart emptied its memory): it says
+	// nothing about the application, so Healthy, the state Argo CD last
+	// reported before the pause in the normal case, replaces it.
+	if applicationHasManagedHealth(app, cfg) {
 		return healthStatus{Status: "Healthy", Message: dormantMessage}, true
 	}
 
@@ -2368,7 +2417,15 @@ func desiredKargoApplicationHealth(runtime *watcherRuntime, app application, cfg
 
 func restoreKargoApplicationsHealth(ctx context.Context, cfg *watcherConfig, runtime *watcherRuntime, apps []application, dormantMessage string) error {
 	for _, app := range apps {
-		if !applicationIsKargoManaged(app) {
+		if !applicationKeepsRealHealth(app) {
+			continue
+		}
+		// Awake (no dormant message): Argo CD owns the health again, so only a
+		// value the watcher wrote is cleared. Restoring a remembered Healthy over a
+		// real Progressing would end a rollout early in Kargo's or Platform's eyes
+		// and, with nothing left looking like work, let the watcher pause mid
+		// rollout.
+		if dormantMessage == "" && !applicationHasManagedHealth(app, *cfg) {
 			continue
 		}
 		if applicationSyncIntentFingerprint(app) != "" {
@@ -2410,22 +2467,12 @@ func touchVCILastActivityOnWake(ctx context.Context, cfg *watcherConfig, vci vir
 		return
 	}
 
-	if err := cfg.api.patchVirtualClusterInstanceLastActivityStatus(ctx, vci.Metadata.Namespace, vci.Metadata.Name, wakeTime.Unix()); err != nil {
-		log.Printf(
-			"best-effort update of VCI %s/%s sleepModeConfig.status.lastActivity failed after wake: %v",
-			vci.Metadata.Namespace,
-			vci.Metadata.Name,
-			err,
-		)
+	if err := cfg.api.patchVirtualClusterInstanceActivity(ctx, vci.Metadata.Namespace, vci.Metadata.Name, wakeTime.Unix(), cfg.wakeSubject); err != nil {
+		log.Printf("best-effort update of VCI %s/%s %s after wake failed: %v", vci.Metadata.Namespace, vci.Metadata.Name, sleepModeLastActivityAnno, err)
 		return
 	}
 
-	log.Printf(
-		"updated VCI %s/%s sleepModeConfig.status.lastActivity to %d after wake",
-		vci.Metadata.Namespace,
-		vci.Metadata.Name,
-		wakeTime.Unix(),
-	)
+	log.Printf("set VCI %s/%s %s to %d after wake", vci.Metadata.Namespace, vci.Metadata.Name, sleepModeLastActivityAnno, wakeTime.Unix())
 }
 
 // reconcileIndex bundles the per-pass indexes shared by every VirtualClusterInstance.
@@ -2434,6 +2481,9 @@ type reconcileIndex struct {
 	appsByDestinationServer map[string][]application
 	clusterSecrets          *clusterSecretIndex
 	kargoWakeTriggers       map[string]kargoWakeTrigger
+	// platformTriggers maps a VCI (namespace/name) to its vCluster Platform
+	// ArgoCDApplications with a pending refresh or sync.
+	platformTriggers map[string]map[string]string
 }
 
 func serversFromApplications(apps []application) []string {
@@ -2516,7 +2566,14 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	if resolved.server != "" {
 		serverMatchedApps = idx.appsByDestinationServer[resolved.server]
 	}
-	apps := unionApplications(nameMatchedApps, serverMatchedApps)
+	// The resolved Secret's own cluster name can differ from every expected name
+	// (the platform's hashed or truncated v2 name, found by labels or server), and
+	// Akuity-style Applications address the cluster by that name.
+	var resolvedNameApps []application
+	if resolved.secret != nil && resolved.clusterName != "" {
+		resolvedNameApps = idx.appsByDestinationName[resolved.clusterName]
+	}
+	apps := unionApplications(nameMatchedApps, serverMatchedApps, resolvedNameApps)
 
 	kargoWakeTrigger := firstKargoTrigger(idx.kargoWakeTriggers, append(append([]string{}, expectedNames...), resolved.server))
 
@@ -2567,7 +2624,12 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	// a reason to wake a sleeping one.
 	awaitingFirstReconcileApps := applicationsAwaitingFirstReconcile(apps)
 	rollingOutApps := applicationsRollingOut(apps, *cfg)
-	pendingReconcile := len(awaitingFirstReconcileApps) > 0 || len(rollingOutApps) > 0
+	// vCluster Platform waiting on Argo CD for this cluster: a refresh or sync on
+	// one of its ArgoCDApplications (cleared only once Argo CD did it), or an
+	// Application it created that Argo CD never reconciled.
+	platformWork := pendingPlatformWork(idx.platformTriggers[instanceKey(vci.Metadata.Namespace, vci.Metadata.Name)], apps)
+	newPlatformWorkNames := newPlatformWork(runtime, runtimeKey, platformWork)
+	pendingReconcile := len(awaitingFirstReconcileApps) > 0 || len(rollingOutApps) > 0 || len(platformWork) > 0
 	if kargoWakeTrigger.Fingerprint == "" {
 		delete(runtime.observedKargoPromotions, runtimeKey)
 	}
@@ -2589,6 +2651,18 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		}
 		mode := wakeModeForVCI(cfg, runtime, vci)
 		wakeAllowed := mode != wakeModeOff
+		// Platform refuses any wake through its proxy (400 ForcedSleeping) for a
+		// scheduled sleep or a forced sleep with a duration, until the schedule or
+		// duration ends. Trying would only fail on every retry.
+		if sleepType := strings.TrimSpace(vci.Metadata.Annotations[sleepTypeAnnotation]); sleepType == "scheduledSleep" || sleepType == "forcedDurationSleep" {
+			if wakeAllowed && hasActiveWork && runtime.unwakeableLogged[runtimeKey] != sleepType {
+				runtime.unwakeableLogged[runtimeKey] = sleepType
+				log.Printf("not waking sleeping VCI %s/%s despite pending GitOps work: it is in a %s, which vCluster Platform does not let requests wake; the work runs once it wakes", vci.Metadata.Namespace, vci.Metadata.Name, sleepType)
+			}
+			wakeAllowed = false
+		} else {
+			delete(runtime.unwakeableLogged, runtimeKey)
+		}
 		if cfg.wakeRequester != nil && !wakeAllowed {
 			if hasActiveWork && !runtime.wakeSuppressedLogged[runtimeKey] {
 				runtime.wakeSuppressedLogged[runtimeKey] = true
@@ -2642,6 +2716,17 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				}
 			}
 
+			if !shouldWake && len(platformWork) > 0 {
+				if len(newPlatformWorkNames) > 0 || wakeRetryDue(runtime, runtimeKey, cfg.wakeRetryInterval, now) {
+					shouldWake = true
+					names := newPlatformWorkNames
+					if len(names) == 0 {
+						names = platformWorkNames(platformWork)
+					}
+					triggerReason = "vCluster Platform requests on " + strings.Join(names, ", ")
+				}
+			}
+
 			if shouldWake {
 				if err := cfg.wakeRequester.Execute(ctx, project, vci.Metadata.Namespace, vci.Metadata.Name); err != nil {
 					return fmt.Errorf(
@@ -2659,6 +2744,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 				rememberSyncIntentApplications(runtime, syncIntentApps)
 				rememberRefreshRequestApplications(runtime, refreshRequestApps)
 				rememberRevisionWakeApplications(runtime, revisionWakeApps)
+				rememberPlatformWork(runtime, runtimeKey, platformWork)
 				if kargoWakeTrigger.Fingerprint != "" {
 					runtime.observedKargoPromotions[runtimeKey] = kargoWakeTrigger.Fingerprint
 				}
@@ -2684,6 +2770,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
+		rememberPlatformWork(runtime, runtimeKey, platformWork)
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		if pauseEnabled && !secretPaused {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, true); err != nil {
@@ -2731,6 +2818,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberSyncIntentApplications(runtime, syncIntentApps)
 		rememberRefreshRequestApplications(runtime, refreshRequestApps)
 		rememberRevisionWakeApplications(runtime, revisionWakeApps)
+		rememberPlatformWork(runtime, runtimeKey, platformWork)
 
 		if pauseEnabled && secretPaused && shouldUnpauseReadyCluster {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, false); err != nil {
@@ -2882,6 +2970,7 @@ func reconcileAll(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		appsByDestinationServer: applicationsByDestinationServer(apps),
 		clusterSecrets:          buildClusterSecretIndexForReconcile(ctx, cfg),
 		kargoWakeTriggers:       kargoWakeTriggersByDestination(apps, promotions),
+		platformTriggers:        platformTriggersByVCI(listPlatformArgoCDApplicationsOptional(ctx, cfg, runtime)),
 	}
 
 	for _, vci := range vcis {

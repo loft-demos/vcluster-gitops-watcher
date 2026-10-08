@@ -133,9 +133,12 @@ watcher:
     timeout: ""
     retryInterval: ""
     # Additional wake response codes treated as accepted, beyond 200 and 202.
+    # Empty uses the watcher default, 504. Don't add 502: vCluster Platform
+    # returns it when it skips the wake, so the VCI stays asleep.
     successOn: ""
-    # Best-effort patch of the VCI sleep lastActivity after a successful wake.
-    # Also adds the virtualclusterinstances/status patch RBAC.
+    # Best-effort update of the VCI's sleepmode.loft.sh/last-activity annotations
+    # (with the watcher's subject) after a successful wake.
+    # Also adds patch RBAC on virtualclusterinstances (VCIs have no status subresource).
     updateVCILastActivity: false
 
   # Additional environment variables, for example WATCH_KUBERNETES_TIMEOUT.

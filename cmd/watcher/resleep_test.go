@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -17,8 +18,10 @@ const testWakeSubject = "loft:user:gitops-watcher"
 // sleep patches on VCIs and serves Kargo Stages by "namespace/name".
 type resleepAPI struct {
 	forcePatches []string
-	stages       map[string]string // "namespace/name" -> Ready condition status
-	stageStatus  int
+	// activityPatches are keep-alive patches: the last-activity-info JSON written.
+	activityPatches []string
+	stages          map[string]string // "namespace/name" -> Ready condition status
+	stageStatus     int
 }
 
 func (f *resleepAPI) server(t *testing.T) *httptest.Server {
@@ -29,10 +32,15 @@ func (f *resleepAPI) server(t *testing.T) *httptest.Server {
 			body, _ := io.ReadAll(r.Body)
 			var patch map[string]map[string]map[string]string
 			_ = json.Unmarshal(body, &patch)
-			if patch["metadata"]["annotations"][sleepModeForceAnnotation] != "true" {
+			annotations := patch["metadata"]["annotations"]
+			switch {
+			case annotations[sleepModeForceAnnotation] == "true":
+				f.forcePatches = append(f.forcePatches, r.URL.Path)
+			case annotations[sleepModeLastActivityAnno] != "":
+				f.activityPatches = append(f.activityPatches, annotations[sleepModeLastActivityInfoAnno])
+			default:
 				t.Errorf("unexpected VCI patch %s", body)
 			}
-			f.forcePatches = append(f.forcePatches, r.URL.Path)
 			_, _ = w.Write([]byte(`{}`))
 		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, "/stages/"):
 			if f.stageStatus != 0 {
@@ -67,14 +75,15 @@ func resleepConfig(t *testing.T, fake *resleepAPI, wakeSubject string) *watcherC
 	}
 }
 
+// resleepVCI builds a VCI the way the watcher lists it: Platform keeps activity
+// in sleepmode.loft.sh annotations; status.sleepModeConfig is only filled in for
+// ?extended=true reads, which the watcher does not make.
 func resleepVCI(lastActivity int64, subject string) virtualClusterInstance {
-	return virtualClusterInstance{
-		Metadata: metadata{Name: "team-a", Namespace: "p-demo"},
-		Status: virtualClusterStatus{SleepModeConfig: &vciSleepModeConfig{Status: vciSleepModeStatus{
-			LastActivity:     lastActivity,
-			LastActivityInfo: &vciLastActivityInfo{Subject: subject},
-		}}},
+	annotations := map[string]string{sleepModeLastActivityAnno: strconv.FormatInt(lastActivity, 10)}
+	if subject != "" {
+		annotations[sleepModeLastActivityInfoAnno] = `{"subject":"` + subject + `"}`
 	}
+	return virtualClusterInstance{Metadata: metadata{Name: "team-a", Namespace: "p-demo", Annotations: annotations}}
 }
 
 func deployedApp(name string) application {
@@ -166,6 +175,12 @@ func TestSleepAfterSyncWaitsForDeploy(t *testing.T) {
 			}
 			if len(fake.forcePatches) != 0 {
 				t.Fatalf("expected no sleep while the deploy is unfinished")
+			}
+			// The last activity is five minutes old, so while it waits for the
+			// deploy the watcher records activity of its own, under its subject.
+			want := []string{`{"subject":"` + testWakeSubject + `"}`}
+			if strings.Join(fake.activityPatches, ",") != strings.Join(want, ",") {
+				t.Fatalf("expected keep-alive patches %v, got %v", want, fake.activityPatches)
 			}
 			state := runtime.sleepAfterSync["team-a"]
 			if state == nil || state.blocker == "" {

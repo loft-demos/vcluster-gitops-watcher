@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -36,6 +37,9 @@ const (
 	// the same as `vcluster platform sleep`. Platform clears it on new activity.
 	sleepModeForceAnnotation  = "sleepmode.loft.sh/force"
 	sleepModeLastActivityAnno = "sleepmode.loft.sh/last-activity"
+	// sleepModeLastActivityInfoAnno holds Platform's JSON LastActivityInfo;
+	// its subject names who caused the last activity.
+	sleepModeLastActivityInfoAnno = "sleepmode.loft.sh/last-activity-info"
 
 	// otherActivitySlackSeconds absorbs Platform's own timestamp updates when
 	// the wake subject is unknown and activity is compared by time only.
@@ -207,6 +211,7 @@ func sleepAfterSyncIfDone(ctx context.Context, cfg *watcherConfig, runtime *watc
 
 	if blocker := deployBlocker(cfg, now, state, apps, hasActiveWork); blocker != "" {
 		state.blocker = blocker
+		keepAwakeDuringDeploy(ctx, cfg, vci, activity, now)
 		return nil
 	}
 	if blocker, err := kargoStagesBlocker(ctx, cfg, apps); err != nil || blocker != "" {
@@ -231,9 +236,20 @@ func sleepAfterSyncIfDone(ctx context.Context, cfg *watcherConfig, runtime *watc
 func vciLastActivity(vci virtualClusterInstance) (int64, string) {
 	var activity int64
 	subject := ""
+	// The annotations are Platform's record. status.sleepModeConfig is filled in
+	// only for ?extended=true reads, which the watcher does not make, so it is
+	// just a fallback for API shapes that do carry it.
+	if raw := strings.TrimSpace(vci.Metadata.Annotations[sleepModeLastActivityInfoAnno]); raw != "" {
+		var info struct {
+			Subject string `json:"subject"`
+		}
+		if err := json.Unmarshal([]byte(raw), &info); err == nil {
+			subject = strings.TrimSpace(info.Subject)
+		}
+	}
 	if config := vci.Status.SleepModeConfig; config != nil {
 		activity = config.Status.LastActivity
-		if config.Status.LastActivityInfo != nil {
+		if subject == "" && config.Status.LastActivityInfo != nil {
 			subject = strings.TrimSpace(config.Status.LastActivityInfo.Subject)
 		}
 	}
@@ -327,4 +343,24 @@ func (a *kubernetesAPI) patchVirtualClusterInstanceForceSleep(ctx context.Contex
 			"annotations": map[string]any{sleepModeForceAnnotation: "true"},
 		},
 	})
+}
+
+// deployKeepAliveInterval is how stale the VCI's last activity may get while the
+// watcher waits for a deploy, before it records activity of its own.
+const deployKeepAliveInterval = time.Minute
+
+// keepAwakeDuringDeploy records the watcher's own activity while a deploy it
+// woke the VCI for is still running. Argo CD's traffic does not count as
+// activity (Platform marks the integration's access key ignore-activity), so a
+// deploy longer than the inactivity timeout would otherwise be put to sleep
+// halfway. It needs the watcher's subject: without one, sync mode tells other
+// users from the watcher by timestamps alone and would read this as someone
+// else using the VCI.
+func keepAwakeDuringDeploy(ctx context.Context, cfg *watcherConfig, vci virtualClusterInstance, activity int64, now time.Time) {
+	if cfg.wakeSubject == "" || cfg.api == nil || now.Unix()-activity < int64(deployKeepAliveInterval/time.Second) {
+		return
+	}
+	if err := cfg.api.patchVirtualClusterInstanceActivity(ctx, vci.Metadata.Namespace, vci.Metadata.Name, now.Unix(), cfg.wakeSubject); err != nil {
+		log.Printf("keep-alive for VCI %s/%s during its deploy failed: %v", vci.Metadata.Namespace, vci.Metadata.Name, err)
+	}
 }

@@ -34,44 +34,76 @@ func vciUnmanagedReason(cfg *watcherConfig, vci virtualClusterInstance) string {
 	case "true":
 		return ""
 	}
-	if vciUsesPrivateNodes(vci) {
+	switch {
+	case vci.Spec.Standalone || vciValuesBool(vci, "controlPlane", "standalone", "enabled"):
+		return "standalone, which cannot sleep"
+	case vciUsesPrivateNodes(vci):
 		return "private nodes (privateNodes.enabled: true), which cannot sleep"
+	case (vci.Spec.External || vci.Metadata.Annotations[skipHelmDeployAnnotation] == "true") && vci.Spec.ClusterRef == (vciClusterRef{}):
+		return "external and not connected to a cluster, so Platform sleep mode does not apply"
+	case strings.TrimSpace(vci.Metadata.Annotations[sleepScopeAnnotation]) == "workloads-only":
+		return sleepScopeAnnotation + "=workloads-only: only its workloads sleep, so the VCI never looks asleep"
 	}
 	return ""
 }
+
+const (
+	skipHelmDeployAnnotation = "loft.sh/skip-helm-deploy"
+	sleepScopeAnnotation     = "sleepmode.loft.sh/scope"
+)
 
 // vciUsesPrivateNodes reads privateNodes.enabled from the VCI's vcluster.yaml.
 // For a templated VCI only status.virtualCluster carries the resolved values;
 // spec.template covers a VCI whose status has not been written yet.
 func vciUsesPrivateNodes(vci virtualClusterInstance) bool {
-	if vci.Status.VirtualCluster != nil && privateNodesEnabled(vci.Status.VirtualCluster.HelmRelease.Values) {
+	return vciValuesBool(vci, "privateNodes", "enabled")
+}
+
+// vciValuesBool reads a boolean at path from the VCI's vcluster.yaml: the
+// resolved values in status.virtualCluster, else spec.template.
+func vciValuesBool(vci virtualClusterInstance, path ...string) bool {
+	if vci.Status.VirtualCluster != nil && yamlBoolAt(vci.Status.VirtualCluster.HelmRelease.Values, path...) {
 		return true
 	}
-	return vci.Spec.Template != nil && privateNodesEnabled(vci.Spec.Template.HelmRelease.Values)
+	return vci.Spec.Template != nil && yamlBoolAt(vci.Spec.Template.HelmRelease.Values, path...)
 }
 
 // privateNodesEnabled reports whether a vcluster.yaml document sets
-// privateNodes.enabled to true. It reads only that key, in block or flow style,
-// so the watcher keeps its standard-library-only build. Anything it cannot read
-// counts as false, which leaves the VCI managed as before.
+// privateNodes.enabled to true.
 func privateNodesEnabled(values string) bool {
-	lines := strings.Split(values, "\n")
+	return yamlBoolAt(values, "privateNodes", "enabled")
+}
+
+// yamlBoolAt reports whether the vcluster.yaml document has true at the key
+// path, in block style or with a flow mapping at the last level. It reads only
+// what the watcher needs, so the build stays standard-library-only. Anything it
+// cannot read counts as false, which leaves the VCI managed as before.
+func yamlBoolAt(document string, path ...string) bool {
+	if len(path) == 0 {
+		return false
+	}
+	lines := strings.Split(document, "\n")
 	for i := 0; i < len(lines); i++ {
-		line := stripYAMLComment(lines[i])
+		line := strings.TrimRight(stripYAMLComment(lines[i]), " \t\r")
 		if indentation(line) != 0 {
 			continue
 		}
-		rest, ok := strings.CutPrefix(strings.TrimRight(line, " \t\r"), "privateNodes:")
+		rest, ok := strings.CutPrefix(line, path[0]+":")
 		if !ok {
 			continue
 		}
 		rest = strings.TrimSpace(rest)
+		if len(path) == 1 {
+			return yamlTrue(rest)
+		}
 		if strings.HasPrefix(rest, "{") {
-			return flowMappingEnabled(rest)
+			return len(path) == 2 && flowMappingBool(rest, path[1])
 		}
 		if rest != "" {
 			return false
 		}
+		// Collect the nested block, dedented, and look one level deeper.
+		var block []string
 		childIndent := -1
 		for j := i + 1; j < len(lines); j++ {
 			child := strings.TrimRight(stripYAMLComment(lines[j]), " \t\r")
@@ -80,27 +112,25 @@ func privateNodesEnabled(values string) bool {
 			}
 			ind := indentation(child)
 			if ind == 0 {
-				return false
+				break
 			}
 			if childIndent < 0 {
 				childIndent = ind
 			}
-			if ind != childIndent {
-				continue
+			if ind < childIndent {
+				break
 			}
-			if value, ok := strings.CutPrefix(strings.TrimSpace(child), "enabled:"); ok {
-				return yamlTrue(value)
-			}
+			block = append(block, child[childIndent:])
 		}
-		return false
+		return yamlBoolAt(strings.Join(block, "\n"), path[1:]...)
 	}
 	return false
 }
 
-func flowMappingEnabled(flow string) bool {
+func flowMappingBool(flow, key string) bool {
 	flow = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(flow), "{"), "}")
 	for _, pair := range strings.Split(flow, ",") {
-		if value, ok := strings.CutPrefix(strings.TrimSpace(pair), "enabled:"); ok {
+		if value, ok := strings.CutPrefix(strings.TrimSpace(pair), key+":"); ok {
 			return yamlTrue(value)
 		}
 	}

@@ -1,7 +1,8 @@
 # vcluster-gitops-watcher Helm chart
 
 The chart installs `vcluster-gitops-watcher` with the RBAC it needs to read
-`VirtualClusterInstance` objects (and Kargo `Promotion` objects) cluster-wide and
+`VirtualClusterInstance` and vCluster Platform `ArgoCDApplication` objects (and Kargo
+`Promotion` objects) cluster-wide and
 to patch Argo CD cluster Secrets and Applications in the Argo CD namespaces. It
 can also install the optional `vcluster-wakeup-proxy`.
 
@@ -10,7 +11,7 @@ can also install the optional `vcluster-wakeup-proxy`.
 ```bash
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.1.4-rc.1 \
+  --version 2.1.5-rc.1 \
   --namespace argocd
 ```
 
@@ -41,7 +42,7 @@ kubectl -n argocd create secret generic vcluster-platform-token \
 
 helm upgrade --install vcluster-gitops-watcher \
   oci://ghcr.io/loft-demos/charts/vcluster-gitops-watcher \
-  --version 2.1.4-rc.1 \
+  --version 2.1.5-rc.1 \
   --namespace argocd \
   --set watcher.platformHost=platform.example.com \
   --set watcher.wake.upstreamBase=https://platform.example.com \
@@ -114,7 +115,7 @@ Secret is still required with `useProxy`.
 | `watcher.wake.existingSecret` | empty | Secret holding a dedicated Platform access key (`tokenKey`), never the Argo CD integration key |
 | `watcher.wake.accessKey.user` / `.team` | empty | Get short-lived per-tenant-cluster wake tokens by impersonating this Platform user or team, in place of `existingSecret` |
 | `watcher.wake.accessKey.tokenTTL` | `10m` | Lifetime of each wake token; minimum `1m` |
-| `watcher.wake.updateVCILastActivity` | `false` | Patch VCI sleep `lastActivity` after a wake; adds the status RBAC |
+| `watcher.wake.updateVCILastActivity` | `false` | Record the wake as activity on the VCI (`sleepmode.loft.sh/last-activity` annotations); adds `patch` on VCIs |
 | `watcher.extraEnv` | `[]` | Any other watcher variable from the main README |
 | `proxy.enabled` | `false` | Install `vcluster-wakeup-proxy` |
 | `proxy.upstreamBase` | empty | Required when the proxy is enabled |

@@ -5,8 +5,8 @@ description: >-
   GitOps intent (Argo CD sync/refresh, Kargo promotions). Optionally deploys the
   tolerant vcluster-wakeup-proxy.
 type: application
-version: 2.1.4-rc.1
-appVersion: "2.1.4-rc.1"
+version: 2.1.5-rc.1
+appVersion: "2.1.5-rc.1"
 home: https://github.com/loft-demos/vcluster-gitops-watcher
 sources:
   - https://github.com/loft-demos/vcluster-gitops-watcher

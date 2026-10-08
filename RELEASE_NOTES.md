@@ -1,5 +1,53 @@
 # Release Notes
 
+## 2.1.5-rc.1
+
+Fixes from checking the watcher against vCluster Platform 4.13 itself. The most visible one: the watcher's health patching failed healthy Platform Stacks on every sleep.
+
+### Fixed: Platform Stack tasks failed while their tenant cluster slept
+
+The watcher patched every Application on a sleeping tenant cluster to `Suspended`, including the ones vCluster Platform creates for Stacks. Platform copies that health into the Stack task, counts anything but `Healthy` and `Synced` as not ready, and failed the task after its timeout, so the Stack went `Degraded` and the VCI reported `StacksSynced=False` on every sleep. It also made Platform poll Argo CD every 5 seconds instead of every 2 minutes for each sleeping tenant cluster.
+
+- Applications labeled `loft.sh/managed-by: argocdapplication-controller` now get the same treatment as Kargo-managed ones: the watcher keeps their real health status and changes only the message.
+- A `Suspended` or `Progressing` an earlier version left on such an Application is replaced with `Healthy` while the cluster sleeps, which repairs Stacks already failed this way once Platform reads it again.
+- Fixed for Kargo too: on an awake cluster the watcher no longer writes a remembered `Healthy` over Argo CD's real `Progressing`. It now only clears values it wrote itself.
+
+### Fixed: Platform refresh and sync requests stalled behind the pause
+
+Platform asks for a refresh or sync with annotations on its `ArgoCDApplication` objects and calls Argo CD with a 30 second timeout, sending the sync only after the refresh succeeds. On a paused destination the call timed out (`RefreshApplicationFailed`) and Stack tasks failed. A Stack deployed to a sleeping tenant cluster never woke it.
+
+- The watcher now reads `management.loft.sh` `argocdapplications`. A pending `argocdapplication.loft.sh/refresh` or `/sync` keeps an awake destination un-paused until Platform clears it, and wakes a sleeping one. So does an Application Platform created that Argo CD never reconciled.
+- Needs `get` and `list` on `argocdapplications`, added to the chart and `deploy/watcher-rbac.yaml`. Without it the watcher logs once and checks again every five minutes.
+
+### Fixed: a 502 was counted as a started wake
+
+vCluster Platform answers `502` exactly when it skips a wake: an identity or user agent that sleep mode ignores, or forced-duration sleep. The default `WATCH_WAKE_SUCCESS_ON=502,504` logged "triggered wake" every retry while the cluster stayed asleep and its applications stayed paused.
+
+- The default is now `504`. Platform holds a wake request until the cluster is ready, so a gateway timeout, like the watcher's own client timeout, still means the wake started.
+- Wake requests send `User-Agent: vcluster-gitops-watcher`, so they can be recognised in Platform logs and kept out of sleep-mode `ignore-user-agents` rules.
+
+### Fixed: a waking VCI was classified as sleeping
+
+While a tenant cluster starts, Platform keeps `VirtualClusterReady` at reason `Sleeping` until its API answers. The watcher matched "sleep" anywhere in conditions, so it saw the whole wake as sleep: applications said `vCluster sleeping` instead of `waking`, and every retry sent another wake request that Platform held for up to two minutes, stalling the watcher's loop.
+
+- Classification now follows Platform: Sleeping from the `sleepmode.loft.sh/sleeping-since` annotation (or phase `Sleeping`), Waking for phase `Pending` with reason `Sleeping`, Ready for phase `Ready`. `status.online` and `VirtualClusterOnline`, which only say a network peer exists, are no longer readiness signals, and a new VCI that is `Pending` for another reason is no longer treated as waking.
+
+### Fixed: scheduled and forced-duration sleep
+
+Platform refuses every wake (`400 ForcedSleeping`) for `sleep-type` `scheduledSleep` and `forcedDurationSleep`. The watcher retried them anyway. It now skips the wake, logs once, and the work runs when the schedule or duration ends.
+
+### More VCIs left alone
+
+Besides private nodes, the watcher now leaves alone every VCI that cannot sleep: standalone (`spec.standalone` or `controlPlane.standalone.enabled`), external VCIs not connected to a cluster, and `sleepmode.loft.sh/scope: workloads-only`, whose VCI never looks asleep.
+
+### Cleanup
+
+- `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE` patched a `status` subresource that VirtualClusterInstances do not have, so it always failed. It now sets the `sleepmode.loft.sh/last-activity` and `last-activity-info` annotations with the watcher's subject, as `vcluster platform wakeup` does. The chart's `virtualclusterinstances/status` RBAC is replaced with `patch` on `virtualclusterinstances`.
+- Sync mode now reads who last used a VCI from the `sleepmode.loft.sh/last-activity-info` annotation. It read `status.sleepModeConfig`, which Platform fills in only for `?extended=true` reads, so the subject check never ran and only timestamps were compared.
+- In sync mode, while a deploy the watcher woke a VCI for is still running, the watcher records activity under its own subject at most once a minute. Argo CD's traffic does not count as activity, so a deploy longer than the inactivity timeout was put to sleep halfway. This needs the watcher's subject, which short-lived wake tokens provide.
+- Applications are also matched by the resolved cluster Secret's own name, which covers Akuity-style destinations addressed by the platform's hashed or truncated name.
+- The README has a new Known Limitations section: two cluster Secrets for one VCI, Applications outside the watched namespace, team-based wake-user access, and long licensed names.
+
 ## 2.1.4-rc.1
 
 The watcher now leaves tenant clusters with private nodes alone, and three fixes found in a review: a VCI could take another VCI's cluster Secret, an Application that stayed OutOfSync woke its VCI every time it fell asleep, and a refresh on an awake but paused cluster never reached Argo CD.

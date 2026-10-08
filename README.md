@@ -32,10 +32,11 @@ It polls `VirtualClusterInstance` objects from the management cluster API and th
 - treats `Application.operation.sync` as an explicit wake signal
 - also treats a newly observed Argo CD refresh annotation as a wake signal, so webhook-driven refreshes can wake a sleeping destination before Argo has started the sync
 - also treats a newly observed Argo CD `OutOfSync` desired revision as a wake signal, so source changes discovered by refresh or webhook can wake a sleeping destination before `Application.operation.sync` exists
-- can optionally patch `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state
+- can optionally record the wake as activity on the matching `VirtualClusterInstance` (the `sleepmode.loft.sh/last-activity` annotations, as `vcluster platform wakeup` does) after a successful wake request
 - removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once per ready transition
 - re-applies `argocd.argoproj.io/skip-reconcile: "true"` on idle ready destinations after wake/sync work has settled so Argo CD cluster-cache traffic does not keep the vCluster warm indefinitely. A destination is not idle while any Application has never been reconciled, is `Progressing`, or has a sync operation running, so Argo CD can carry a new cluster's rollout through to `Healthy` before it is paused
-- optionally patches non-Kargo `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`
+- optionally patches `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`; Kargo- and vCluster Platform-managed Applications keep their real health status and only get the message
+- keeps a destination un-paused, and wakes it, while vCluster Platform waits on Argo CD (Stack task retries, Platform UI Refresh and Sync, Stacks deployed to a sleeping tenant cluster)
 
 Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.
 
@@ -114,7 +115,7 @@ Important watcher settings:
 | `WATCH_POLL_INTERVAL` | `15s` | How often to poll `VirtualClusterInstance` objects |
 | `WATCH_READY_REFRESH_GRACE` | `2m` | After the watcher un-pauses a ready destination, how long a pending Argo CD `refresh` annotation keeps it un-paused. It is re-paused as soon as Argo CD clears the annotation, or when this runs out |
 | `WATCH_PROJECT_NAMESPACE_PREFIXES` | `p-,loft-p-` | Namespace prefixes used when no `loft.sh/project` label is present |
-| `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches non-Kargo `Application.status.health` to `Suspended` or `Progressing` while Argo is paused |
+| `WATCH_PATCH_APPLICATION_HEALTH` | `true` | When not set to `false`, patches `Application.status.health` to `Suspended` or `Progressing` while Argo is paused. Kargo- and vCluster Platform-managed Applications keep their real status and get only the message |
 | `WATCH_SLEEPING_MESSAGE` | `vCluster sleeping` | Health message written when app health patching is enabled |
 | `WATCH_WAKING_MESSAGE` | `vCluster waking` | Health message written when app health patching is enabled |
 | `WATCH_WAKE_UPSTREAM_BASE` | disabled | Optional vCluster Platform base URL used to send the wake request, `GET /kubernetes/project/<project>/virtualcluster/<name>/version`, when a sleeping destination has an active Kargo `Promotion`, a new Argo refresh request, or `Application.operation.sync` |
@@ -124,7 +125,7 @@ Important watcher settings:
 | `WATCH_WAKE_SUBJECT` | derived | `sync` mode: sleep-mode activity subject of the wake credential, for example `loft:user:gitops-watcher`. Derived from `WATCH_WAKE_ACCESS_KEY_USER`/`TEAM`; set it when using a static wake token |
 | `WATCH_ANNOTATION_PREFIX` | `gitops-watcher.loft-demos.github.io` | DNS prefix of the watcher's own VCI annotations. Set it to a domain you control if you fork the watcher |
 | `WATCH_WAKE_TIMEOUT` | `10s` | Timeout for the wake request HTTP client |
-| `WATCH_WAKE_SUCCESS_ON` | `502,504` | Comma-separated additional wake response codes treated as accepted, beyond `200` and `202` |
+| `WATCH_WAKE_SUCCESS_ON` | `504` | Comma-separated additional wake response codes treated as accepted, beyond `200` and `202`. Supported: `429`, `500`, `502`, `504`. Leave `502` out for vCluster Platform: it returns `502` when it skips the wake (an identity or user agent that sleep mode ignores, or forced-duration sleep), so the VCI stays asleep |
 | `WATCH_WAKE_BEARER_TOKEN` | none | Optional bearer token sent with the wake request. Must not be the Argo CD integration access key, see [Wake Token](#wake-token) |
 | `WATCH_WAKE_TOKEN_PATH` | none | Optional path to a file containing the bearer token for the wake request |
 | `WATCH_WAKE_ACCESS_KEY_USER` | none | Get a short-lived, single-tenant-cluster wake token from vCluster Platform for each wake by impersonating this Platform user. Replaces `WATCH_WAKE_BEARER_TOKEN` / `WATCH_WAKE_TOKEN_PATH`, see [Short-Lived Wake Tokens](#short-lived-wake-tokens) |
@@ -132,7 +133,7 @@ Important watcher settings:
 | `WATCH_WAKE_TOKEN_TTL` | `10m` | Lifetime of each short-lived wake token; minimum `1m` |
 | `WATCH_WAKE_CA_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/ca.crt` | CA bundle used when `WATCH_WAKE_UPSTREAM_BASE` is `https://...` |
 | `WATCH_WAKE_RETRY_INTERVAL` | `30s` | Minimum delay before retrying a wake request while the same sync intent is still present and the vCluster remains asleep |
-| `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE` | `false` | When set to `true`, best-effort patches `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state |
+| `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE` | `false` | When set to `true`, best-effort sets the `sleepmode.loft.sh/last-activity` and `last-activity-info` annotations on the matching `VirtualClusterInstance` after a successful wake request, with the watcher's subject. Needs `patch` on `virtualclusterinstances` |
 | `WATCH_KUBERNETES_API` | auto | Optional Kubernetes API base URL. Defaults to the in-cluster API |
 | `WATCH_KUBERNETES_TIMEOUT` | `10s` | Timeout for watcher Kubernetes API requests |
 | `WATCH_TOKEN_PATH` | `/var/run/secrets/kubernetes.io/serviceaccount/token` | Bearer token for watcher API calls |
@@ -146,11 +147,11 @@ Important watcher settings:
 
 The example watcher Deployment uses `WATCH_POLL_INTERVAL=2s` so it can react quickly when a vCluster transitions into sleep.
 
-Application health patching is enabled by default so non-Kargo apps show a helpful `Suspended` or `Progressing` status in Argo CD while their destination vCluster is asleep or waking. Apps annotated with `kargo.akuity.io/authorized-stage` are treated specially: the watcher preserves their last non-watcher health while the destination is dormant and clears stale watcher-managed sleep messages once the destination is ready again. Set `WATCH_PATCH_APPLICATION_HEALTH=false` to disable health patching entirely.
+Application health patching is enabled by default so non-Kargo apps show a helpful `Suspended` or `Progressing` status in Argo CD while their destination vCluster is asleep or waking. Apps annotated with `kargo.akuity.io/authorized-stage`, and apps vCluster Platform created (labeled `loft.sh/managed-by: argocdapplication-controller`, for Stacks, Fleet Observability and the Platform UI), are treated specially: the watcher preserves their last real health status while the destination is dormant, changes only the message, and once the destination is ready again clears only what it wrote itself. Kargo verification and Platform's Stack tasks read the status as a verdict: Platform fails a Stack task that is not `Healthy` and `Synced` within its timeout, so a `Suspended` written over a healthy app would fail a Stack on every sleep. Set `WATCH_PATCH_APPLICATION_HEALTH=false` to disable health patching entirely.
 
 If your cluster does not expose the `applications/status` subresource, the watcher falls back to patching the `Application` resource itself. If that still is not allowed in your cluster, it automatically disables health patching and continues managing cluster-secret pause/unpause plus app refresh.
 
-When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses Argo-only signals such as `Application.operation.sync`, newly observed refresh annotations, and newly observed `OutOfSync` revisions as fallbacks. If you already run `cmd/proxy`, you can point `WATCH_WAKE_UPSTREAM_BASE` at the proxy service so the watcher reuses the proxy's tolerant wake semantics for transient `502` / `504` responses. If you do not need that behavior, point the watcher directly at the vCluster Platform API instead.
+When `WATCH_WAKE_UPSTREAM_BASE` is set, the watcher treats active Kargo `Promotion`s that use `argocd-update` as the earliest wake signal for sleeping destinations and still uses Argo-only signals such as `Application.operation.sync`, newly observed refresh annotations, and newly observed `OutOfSync` revisions as fallbacks. Point `WATCH_WAKE_UPSTREAM_BASE` at the vCluster Platform API, or at the `cmd/proxy` service if you already run it. Against Platform directly, the watcher treats only `504` (or its own client timeout) as a started wake: Platform holds a wake request until the tenant cluster is ready, while a `502` means Platform skipped the wake.
 
 ### Choosing Which VCIs to Wake
 
@@ -176,21 +177,38 @@ metadata:
 
 Only wake requests change. A VCI the watcher does not wake is still paused with `skip-reconcile` while it sleeps, and its applications still show `Suspended` / `vCluster sleeping`. Pending syncs wait until the VCI is woken some other way, for example from the vCluster Platform UI or by a user's own request, and then run as usual.
 
+A VCI in a scheduled sleep or a forced sleep with a duration (`sleepmode.loft.sh/sleep-type` `scheduledSleep` or `forcedDurationSleep`, for example `vcluster platform sleep --prevent-wakeup`) is never woken: vCluster Platform refuses those wakes with `400 ForcedSleeping`. The watcher logs that once, and the work runs when the schedule or duration ends.
+
 An invalid value, anything other than `"true"`, `"false"`, or `"sync"`, is logged once and the global mode applies. Use a VirtualClusterInstance template's `metadata.annotations` to set the annotation on every VCI created from that template.
 
 ### VCIs the Watcher Leaves Alone
 
-A tenant cluster with private nodes cannot sleep, so the watcher has nothing to save by pausing Argo CD for it, and a pause can only hold up work Argo CD has to finish. The watcher detects `privateNodes.enabled: true` in the VCI's vcluster.yaml (`status.virtualCluster.helmRelease.values` for a VCI created from a template, `spec.template.helmRelease.values` otherwise) and leaves that VCI alone: it never pauses it, never patches its applications' health, and never wakes or re-sleeps it. If an earlier watcher version left `skip-reconcile` on its cluster Secret, the watcher removes it once and logs why.
+Some tenant clusters cannot sleep, so the watcher has nothing to save by pausing Argo CD for them, and a pause can only hold up work Argo CD has to finish. The watcher leaves these alone:
+
+- private nodes: `privateNodes.enabled: true`
+- standalone: `spec.standalone`, or `controlPlane.standalone.enabled: true`
+- external and not connected to a cluster: `spec.external` or `loft.sh/skip-helm-deploy: "true"`, with an empty `spec.clusterRef`
+- `sleepmode.loft.sh/scope: workloads-only`: only the workloads sleep, so the VCI never looks asleep and a re-sleep would do nothing
+
+For private nodes and standalone, the watcher reads the VCI's vcluster.yaml (`status.virtualCluster.helmRelease.values` for a VCI created from a template, `spec.template.helmRelease.values` otherwise), the same field the vCluster Platform UI uses. For any of them it never pauses the VCI, never patches its applications' health, and never wakes or re-sleeps it. If an earlier watcher version left `skip-reconcile` on its cluster Secret, the watcher removes it once and logs why.
 
 Override the detection per VCI with the `gitops-watcher.loft-demos.github.io/manage` annotation:
 
 | Annotation value | Effect |
 | --- | --- |
-| `"false"` | The watcher leaves the VCI alone, whether or not it uses private nodes |
-| `"true"` | The watcher manages the VCI even if it uses private nodes |
-| absent | Private-nodes VCIs are left alone, all others are managed |
+| `"false"` | The watcher leaves the VCI alone, whatever kind it is |
+| `"true"` | The watcher manages the VCI even if it is one of the kinds above |
+| absent | The kinds above are left alone, all others are managed |
 
 The watcher logs `not managing VCI <namespace>/<name>: <reason>` once when it starts leaving a VCI alone.
+
+### vCluster Platform Requests
+
+vCluster Platform drives its own Argo CD Applications (Stack tasks, Fleet Observability, the Platform UI) through `ArgoCDApplication` objects. It asks for a refresh or sync with the `argocdapplication.loft.sh/refresh` and `argocdapplication.loft.sh/sync` annotations, removes them only once Argo CD has done it, and calls Argo CD's refresh API with a 30 second timeout. On a paused destination that call times out, the sync is never sent, and the Stack task fails with `RefreshApplicationFailed`.
+
+The watcher reads those objects (`management.loft.sh` `argocdapplications`, matched to a VCI by `spec.destination.virtualCluster.name` in the project namespace) and treats a pending request as work: an awake destination stays un-paused until Platform clears the request, and a sleeping one is woken. An Argo CD Application that Platform created and Argo CD never reconciled, a Stack deployed to a sleeping tenant cluster, also wakes it. A user's own new Application still does not.
+
+This needs `get` and `list` on `argocdapplications`, included in the chart and in [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml). Without it, the watcher logs once and checks again every five minutes.
 
 ### Sleep After Sync
 
@@ -316,9 +334,16 @@ Before 2.1.0-rc.1, this mode created a long-lived `vcluster-gitops-watcher-wake`
 kubectl delete accesskeys.storage.loft.sh vcluster-gitops-watcher-wake
 ```
 
-When `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE=true`, the watcher also performs a best-effort patch of `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` immediately after a successful wake request. This is intended as a pragmatic workaround for environments where platform UI sleep badges can remain stale after a GitOps-driven wake. To use it, apply the VCI status patch RBAC from [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml).
+When `WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE=true`, the watcher also records the wake as activity on the matching `VirtualClusterInstance` immediately after a successful wake request: it sets the `sleepmode.loft.sh/last-activity` annotation and `last-activity-info` with its own subject, the same annotations `vcluster platform wakeup` sets. VirtualClusterInstances have no status subresource, so earlier versions' status patch never applied. The `patch` on `virtualclusterinstances` in [deploy/watcher-rbac.yaml](deploy/watcher-rbac.yaml) covers it.
 
 Build the watcher image with [Dockerfile.watcher](Dockerfile.watcher).
+
+### Known Limitations
+
+- **One cluster Secret per VCI.** A VCI registered by both the legacy v1 integration (`loft-<project>-vcluster-<name>`) and the v2 connector has two Argo CD cluster Secrets with the same server. The watcher pauses the one it resolves (the v2 Secret when the VCI carries `loft.sh/argocd-registered-cluster-name`), so Applications on the other one keep reconciling.
+- **One Application namespace.** The watcher reads Applications from `ARGOCD_APPLICATION_NAMESPACE` only. vCluster Platform puts them in the connector Secret's `namespace`, or the project's `argoIntegration.namespace` for v1. Applications elsewhere are not seen, so a destination with work only there can be paused.
+- **Wake user groups.** Short-lived wake tokens impersonate the user with only its `loft:user:<name>` group. Grant the wake user's project access to the user directly, not through a team.
+- **Long licensed names.** A v2 cluster name over 49 characters carries a hash of the Platform instance ID before truncation, which the watcher cannot recompute. It finds those Secrets through the `loft.sh/argocd-registered-cluster-name` annotation and the Secret labels instead.
 
 ## Akuity-Hosted Phase 1 (Optional Alternative)
 

@@ -12,8 +12,13 @@ rules:
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
     verbs: ["get", "list", "watch"]
+  # Refresh and sync requests vCluster Platform is waiting on Argo CD for.
+  - apiGroups: ["management.loft.sh"]
+    resources: ["argocdapplications"]
+    verbs: ["get", "list"]
   # Only needed for WATCH_WAKE_DEFAULT=sync or the wake: "sync" annotation,
-  # which set sleepmode.loft.sh/force on a VCI after its deploy finishes.
+  # which set sleepmode.loft.sh/force on a VCI after its deploy finishes, and
+  # for WATCH_UPDATE_VCI_LAST_ACTIVITY_ON_WAKE (sleepmode.loft.sh/last-activity).
   - apiGroups: ["management.loft.sh"]
     resources: ["virtualclusterinstances"]
     verbs: ["patch"]
@@ -37,28 +42,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
   name: vcluster-gitops-watcher-vci-read
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata:
-  name: vcluster-gitops-watcher-vci-status-patch
-rules:
-  - apiGroups: ["management.loft.sh"]
-    resources: ["virtualclusterinstances/status"]
-    verbs: ["patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: vcluster-gitops-watcher-vci-status-patch
-subjects:
-  - kind: ServiceAccount
-    name: vcluster-gitops-watcher
-    namespace: argocd
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: vcluster-gitops-watcher-vci-status-patch
 ---
 # Optional: only for WATCH_WAKE_ACCESS_KEY_USER / WATCH_WAKE_ACCESS_KEY_TEAM,
 # where the watcher gets short-lived wake tokens by impersonating that Platform
