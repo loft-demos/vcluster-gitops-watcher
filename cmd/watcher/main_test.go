@@ -2796,3 +2796,195 @@ func TestReconcileVCIRepausesReadyClusterImmediatelyWhenGraceDisabled(t *testing
 		t.Fatalf("expected an immediate re-pause with the grace disabled, paused=%v patches=%d", f.secretPaused, f.secretPatches)
 	}
 }
+
+func TestApplicationAwaitsFirstReconcile(t *testing.T) {
+	cases := map[string]struct {
+		status applicationStatus
+		want   bool
+	}{
+		"never reconciled":         {applicationStatus{}, true},
+		"reconciledAt set":         {applicationStatus{ReconciledAt: "2026-10-08T15:23:31Z"}, false},
+		"sync status set":          {applicationStatus{Sync: applicationSync{Status: "OutOfSync"}}, false},
+		"health status set":        {applicationStatus{Health: healthStatus{Status: "Healthy"}}, false},
+		"operation state recorded": {applicationStatus{OperationState: &applicationOperationState{Phase: "Running"}}, false},
+	}
+	for name, tc := range cases {
+		if got := applicationAwaitsFirstReconcile(application{Status: tc.status}); got != tc.want {
+			t.Errorf("%s: applicationAwaitsFirstReconcile = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// newAppTestAPI serves the cluster Secret and records each skip-reconcile patch
+// as true (pause) or false (resume).
+func newAppTestAPI(t *testing.T, secretName string, patches *[]bool) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"metadata":{"annotations":{}}}`))
+		case r.Method == http.MethodPatch && strings.HasSuffix(r.URL.Path, "/secrets/"+secretName):
+			body, _ := io.ReadAll(r.Body)
+			var patch struct {
+				Metadata struct {
+					Annotations map[string]*string `json:"annotations"`
+				} `json:"metadata"`
+			}
+			if err := json.Unmarshal(body, &patch); err != nil {
+				t.Fatalf("decode secret patch: %v", err)
+			}
+			value := patch.Metadata.Annotations[argocdSkipReconcileAnnotation]
+			*patches = append(*patches, value != nil && *value == "true")
+			w.WriteHeader(http.StatusOK)
+		default:
+			t.Fatalf("unexpected %s %s", r.Method, r.URL.Path)
+		}
+	}))
+}
+
+func newAppTestConfig(apiServer *httptest.Server) watcherConfig {
+	return watcherConfig{
+		api: &kubernetesAPI{
+			client:      apiServer.Client(),
+			apiBase:     apiServer.URL,
+			bearerToken: "token",
+		},
+		argocdApplicationNamespace:   "argocd",
+		argocdClusterSecretNamespace: "argocd",
+		clusterSecretNameTemplates:   []string{"loft-{project}-vcluster-{virtualcluster}"},
+		projectNamespacePrefixes:     []string{"p-", "loft-p-"},
+	}
+}
+
+func readyVCIForTest() virtualClusterInstance {
+	return virtualClusterInstance{
+		Metadata: metadata{Name: "team-a", Namespace: "p-demo"},
+		Status: virtualClusterStatus{
+			Phase:      "Ready",
+			Conditions: []condition{{Type: virtualClusterOnlineConditionType, Status: "True"}},
+		},
+	}
+}
+
+// A cluster registered with Argo CD before its first reconcile has Applications
+// with an empty status. Argo CD only fills it in by reconciling, which a paused
+// destination never does, so the watcher must not treat that cluster as idle.
+func TestReconcileVCIDoesNotPauseReadyClusterWhileApplicationsAwaitFirstReconcile(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	apps := map[string][]application{secretName: {{Metadata: metadata{Name: "gpu-operator", ResourceVersion: "1"}}}}
+	idx := reconcileIndexForTest(apps, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 0 {
+		t.Fatalf("expected no secret patch while an application awaits its first reconcile, got %v", patches)
+	}
+}
+
+func TestReconcileVCIUnpausesReadyClusterForApplicationsAwaitingFirstReconcile(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	apps := map[string][]application{secretName: {{Metadata: metadata{Name: "gpu-operator", ResourceVersion: "1"}}}}
+	idx := reconcileIndexForTest(apps, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 1 || patches[0] {
+		t.Fatalf("expected one resume patch for a paused cluster with a never-reconciled application, got %v", patches)
+	}
+}
+
+func TestReconcileVCIRepausesReadyClusterOnceApplicationsHaveReconciled(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	reconciled := application{
+		Metadata: metadata{Name: "gpu-operator", ResourceVersion: "2"},
+		Status: applicationStatus{
+			ReconciledAt: "2026-10-08T15:30:00Z",
+			Sync:         applicationSync{Status: "Synced", Revision: "v26.3.3"},
+			Health:       healthStatus{Status: "Healthy"},
+		},
+	}
+	idx := reconcileIndexForTest(map[string][]application{secretName: {reconciled}}, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), readyVCIForTest(), idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 1 || !patches[0] {
+		t.Fatalf("expected one pause patch once every application has reconciled, got %v", patches)
+	}
+}
+
+func TestReconcileVCIDoesNotPauseUnknownStateClusterWhileApplicationsAwaitFirstReconcile(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+	cfg := newAppTestConfig(apiServer)
+
+	vci := virtualClusterInstance{Metadata: metadata{Name: "team-a", Namespace: "p-demo"}}
+	apps := map[string][]application{secretName: {{Metadata: metadata{Name: "gpu-operator", ResourceVersion: "1"}}}}
+	idx := reconcileIndexForTest(apps, []secret{clusterSecretForTest(secretName, "", false)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if len(patches) != 0 {
+		t.Fatalf("expected no pause while an application awaits its first reconcile, got %v", patches)
+	}
+}
+
+// A never-reconciled application keeps an awake cluster reconciling, but it is
+// not a reason to wake a sleeping one.
+func TestReconcileVCIDoesNotWakeSleepingClusterForApplicationsAwaitingFirstReconcile(t *testing.T) {
+	const secretName = "loft-demo-vcluster-team-a"
+	var patches []bool
+	apiServer := newAppTestAPI(t, secretName, &patches)
+	defer apiServer.Close()
+
+	wakeCalls := 0
+	wakeServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		wakeCalls++
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer wakeServer.Close()
+
+	cfg := newAppTestConfig(apiServer)
+	cfg.wakeRequester = &wakeRequester{
+		client:           wakeServer.Client(),
+		baseURL:          wakeServer.URL,
+		acceptedStatuses: parseStatusSet("502,504"),
+	}
+	cfg.wakeRetryInterval = time.Second
+
+	vci := virtualClusterInstance{Metadata: metadata{
+		Name:        "team-a",
+		Namespace:   "p-demo",
+		Annotations: map[string]string{sleepingSinceAnnotation: "1711800000"},
+	}}
+	apps := map[string][]application{secretName: {{Metadata: metadata{Name: "gpu-operator", ResourceVersion: "1"}}}}
+	idx := reconcileIndexForTest(apps, []secret{clusterSecretForTest(secretName, "", true)}, nil)
+
+	if err := reconcileVCI(context.Background(), &cfg, newWatcherRuntime(), vci, idx); err != nil {
+		t.Fatalf("unexpected reconcile error: %v", err)
+	}
+	if wakeCalls != 0 {
+		t.Fatalf("expected no wake for a never-reconciled application, got %d", wakeCalls)
+	}
+}

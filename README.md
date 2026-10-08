@@ -34,7 +34,7 @@ It polls `VirtualClusterInstance` objects from the management cluster API and th
 - also treats a newly observed Argo CD `OutOfSync` desired revision as a wake signal, so source changes discovered by refresh or webhook can wake a sleeping destination before `Application.operation.sync` exists
 - can optionally patch `status.sleepModeConfig.status.lastActivity` on the matching `VirtualClusterInstance` after a successful wake request to help clear stale sleeping UI state
 - removes `skip-reconcile` and annotates matching apps with `argocd.argoproj.io/refresh: hard` once per ready transition
-- re-applies `argocd.argoproj.io/skip-reconcile: "true"` on idle ready destinations after wake/sync work has settled so Argo CD cluster-cache traffic does not keep the vCluster warm indefinitely
+- re-applies `argocd.argoproj.io/skip-reconcile: "true"` on idle ready destinations after wake/sync work has settled so Argo CD cluster-cache traffic does not keep the vCluster warm indefinitely. A destination with an Application that Argo CD has never reconciled is not idle, so a newly registered cluster gets its first reconcile before it is paused
 - optionally patches non-Kargo `Application.status.health` while sleeping or waking unless `WATCH_PATCH_APPLICATION_HEALTH=false`
 
 Sleep detection prefers the platform-managed annotations `sleepmode.loft.sh/sleeping-since` and `sleepmode.loft.sh/sleep-type`, then falls back to `status.phase`, `status.reason`, `status.message`, and the `VirtualClusterOnline` condition.

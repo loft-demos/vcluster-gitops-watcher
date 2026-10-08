@@ -1,5 +1,15 @@
 # Release Notes
 
+## Unreleased
+
+### Fixed: a new tenant cluster could stay paused before its first Argo CD reconcile
+
+A tenant cluster that registers with Argo CD while it is still coming up was re-paused about a second later as an "idle ready" destination, and it stayed paused. The watcher keeps a ready destination un-paused only for sync intent, an `OutOfSync` revision or a Kargo promotion, and Argo CD writes all of those by reconciling. A new Application on a paused destination is never reconciled, so it never showed work, so the destination was never un-paused. Every Argo CD Application on the cluster, including Stack tasks and the Fleet Observability collector, sat with an empty status. Stack tasks then failed with `RefreshApplicationFailed`. Refreshing, invalidating the Argo CD cluster cache and restarting the application controller did not help, because Argo CD was correctly skipping a cluster marked `skip-reconcile`. Only a manual sync, which sets a sync intent, released it.
+
+- An Application that Argo CD has never reconciled (no `reconciledAt`, no sync or health status, no operation state) now counts as work for a ready destination, and for one in an unknown state. The watcher does not pause it, and un-pauses it if it is already paused, logging `removed ... : applications <names> have never been reconciled`. `sync` mode also waits for it before putting the VCI back to sleep.
+- Once every Application has reconciled, the destination is re-paused as before.
+- It is not a wake signal: a sleeping VCI with a new Application stays asleep until one of the existing wake signals fires.
+
 ## 2.1.1-rc.1
 
 Two fixes. The `CreateContainerConfigError` fix was prepared as 2.1.0-rc.2, which was never published, so it ships here.

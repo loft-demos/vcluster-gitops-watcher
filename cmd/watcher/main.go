@@ -219,6 +219,7 @@ type applicationStatus struct {
 	Health         healthStatus               `json:"health"`
 	Sync           applicationSync            `json:"sync"`
 	OperationState *applicationOperationState `json:"operationState,omitempty"`
+	ReconciledAt   string                     `json:"reconciledAt,omitempty"`
 }
 
 type applicationOperationState struct {
@@ -1934,6 +1935,30 @@ func applicationsWithRefreshRequest(apps []application) []application {
 	return filtered
 }
 
+// applicationAwaitsFirstReconcile reports whether Argo CD has never reconciled the
+// Application: no reconciledAt, no sync or health status, no operation state.
+// Every other work signal (sync intent, an OutOfSync revision) is written by
+// Argo CD's own reconcile, so a new Application on a paused destination never
+// produces one. Treating it as work breaks that deadlock: without it, a cluster
+// registered before its first reconcile is paused as idle and stays paused.
+func applicationAwaitsFirstReconcile(app application) bool {
+	status := app.Status
+	return strings.TrimSpace(status.ReconciledAt) == "" &&
+		strings.TrimSpace(status.Sync.Status) == "" &&
+		strings.TrimSpace(status.Health.Status) == "" &&
+		status.OperationState == nil
+}
+
+func applicationsAwaitingFirstReconcile(apps []application) []application {
+	var filtered []application
+	for _, app := range apps {
+		if applicationAwaitsFirstReconcile(app) {
+			filtered = append(filtered, app)
+		}
+	}
+	return filtered
+}
+
 func applicationRevisionWakeFingerprint(app application) string {
 	if applicationSyncIntentFingerprint(app) != "" {
 		return ""
@@ -2438,6 +2463,9 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 	hasActiveWork := kargoWakeTrigger.Fingerprint != "" ||
 		len(syncIntentApps) > 0 ||
 		len(revisionWakeApps) > 0
+	// Not part of hasActiveWork: a new Application is a reason to keep an awake
+	// cluster reconciling, not a reason to wake a sleeping one.
+	awaitingFirstReconcileApps := applicationsAwaitingFirstReconcile(apps)
 	if kargoWakeTrigger.Fingerprint == "" {
 		delete(runtime.observedKargoPromotions, runtimeKey)
 	}
@@ -2573,7 +2601,7 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 		rememberKargoApplicationsHealth(runtime, apps, *cfg)
 		needsReadyRefresh := applicationsNeedReadyRefresh(apps, *cfg)
 		needsOneTimeReadyRefresh := needsReadyRefresh && !runtime.observedReadyRefreshes[runtimeKey]
-		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh
+		shouldUnpauseReadyCluster := hasActiveWork || needsOneTimeReadyRefresh || len(awaitingFirstReconcileApps) > 0
 		// Refresh annotations are edge-triggered wake signals, not persistent
 		// work: a stale one must not keep the destination un-paused forever.
 		// But right after the watcher un-pauses, a pending refresh (its own
@@ -2593,7 +2621,11 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, false); err != nil {
 				return fmt.Errorf("resume cluster secret %s/%s: %w", cfg.argocdClusterSecretNamespace, secretMetaName, err)
 			}
-			log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
+			if !hasActiveWork && !needsOneTimeReadyRefresh {
+				log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s: applications %s have never been reconciled", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name, strings.Join(applicationNames(awaitingFirstReconcileApps), ", "))
+			} else {
+				log.Printf("removed %s from cluster secret %s/%s for ready VCI %s/%s", argocdSkipReconcileAnnotation, cfg.argocdClusterSecretNamespace, secretMetaName, vci.Metadata.Namespace, vci.Metadata.Name)
+			}
 			secretPaused = false
 			runtime.readyUnpausedAt[runtimeKey] = time.Now()
 		}
@@ -2624,13 +2656,13 @@ func reconcileVCI(ctx context.Context, cfg *watcherConfig, runtime *watcherRunti
 			delete(runtime.readyUnpausedAt, runtimeKey)
 		}
 		delete(runtime.lastWakeAttempt, runtimeKey)
-		if err := sleepAfterSyncIfDone(ctx, cfg, runtime, vci, runtimeKey, apps, hasActiveWork || refreshPendingInGrace); err != nil {
+		if err := sleepAfterSyncIfDone(ctx, cfg, runtime, vci, runtimeKey, apps, hasActiveWork || refreshPendingInGrace || len(awaitingFirstReconcileApps) > 0); err != nil {
 			return err
 		}
 	case vciStateUnknown:
 		delete(runtime.observedReadyRefreshes, runtimeKey)
 		delete(runtime.readyUnpausedAt, runtimeKey)
-		if pauseEnabled && !secretPaused && !hasActiveWork {
+		if pauseEnabled && !secretPaused && !hasActiveWork && len(awaitingFirstReconcileApps) == 0 {
 			if err := cfg.api.patchSecretSkipReconcile(ctx, cfg.argocdClusterSecretNamespace, secretMetaName, true); err != nil {
 				return fmt.Errorf("pause cluster secret %s/%s during unknown state: %w", cfg.argocdClusterSecretNamespace, secretMetaName, err)
 			}
